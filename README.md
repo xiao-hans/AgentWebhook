@@ -1,13 +1,31 @@
 # AgentWebhook
 
-一个给编码 Agent 用的**带签名回调（signed webhook）交付层**：注册一个正在跑的
-任务，读取它的会话文件，判断它是完成了、失败了还是卡住了，然后把这件事作为一条
-事件（event）签名后投递到接收端的 webhook，并在接收端回执（receipt）之后做二次校验。
+**给编码 Agent 用的带签名回调（signed webhook）交付层**：注册一个正在跑的任务，
+读取它的会话文件，判断它是完成了、失败了还是卡住了，然后把这件事作为一条事件（event）
+签名后投递到接收端的 webhook，并在接收端回执（receipt）之后做二次校验。
 
-它解决的唯一问题是：**"我以为它还在跑"和"它其实已经停下"不能靠猜**。所有判断都来自
+A signed-webhook delivery layer for coding agents — register a running task, read its
+session file, judge whether it finished, failed or stalled, deliver that as a signed
+event to a webhook, and re-verify it after the receiver's receipt.
+
+它解决的唯一问题是：**“我以为它还在跑”和“它其实已经停下”不能靠猜**。所有判断都来自
 会话文件里可读的记录，所有投递都有 HMAC 签名和回执可对账。
 
-## 架构
+The one problem it solves: **"I thought it was still running" vs "it had already
+stopped" should never be a guess.** Every verdict comes from readable records in the
+session file, and every delivery carries an HMAC signature with a receipt to reconcile.
+
+## 特点 Features
+
+- **文件队列是唯一事实源**：HTTP 只是运输方式，先落盘再投递，事件、回执、裁决、审计流水都有据可查
+- **签名投递，回执可对账**：HMAC 签名（`X-Hub-Signature-256`），接收端回执后做二次校验
+- **裁决不可变**：verdict 一经写入不可改，要改只能走 `verify-clear`
+- **回环限定**：投递地址只接受 `127.0.0.1` / `localhost`，公网地址会被拒绝——这是设计约束，不是缺省值
+- **零第三方依赖**：纯 Python 标准库，Python 3.11+（用到 `tomllib`）
+- **适配器可选**：Hermes 的 telegram / local 通道都没配也能跑，事件照常到达 webhook 与文件队列
+- **19 个子命令**：登记、判定、投递、认领、回执、校验、归档全套都在 `handoff.py` 里
+
+## 架构 Architecture
 
 ```text
 register  ->  tick  ->  signed send  ->  webhook  ->  router  ->  verify
@@ -41,7 +59,9 @@ register  ->  tick  ->  signed send  ->  webhook  ->  router  ->  verify
   分发器侧的重试退避 60/120/240/480/600 秒、独占租约 120 秒、陈旧锁 300 秒、
   telegram 发送超时 45 秒、本地镜像超时 60 秒，都是编译期常量。
 
-## 快速开始
+## 快速开始 Quick start
+
+前置：Python 3.11+，不需要装任何第三方包。
 
 1. 复制配置样例，填自己的值（两个样例等价，环境变量优先于配置文件）：
 
@@ -73,8 +93,8 @@ register  ->  tick  ->  signed send  ->  webhook  ->  router  ->  verify
    python fake_receiver.py --port 8644 --secret-file <secret-file> --mode ok
    ```
 
-3. 接收端把路由配到 `127.0.0.1`（事件类型 `agent_task_handoff`），然后用事件号跑分发器；
-   不带参数就是全量分发：
+3. 接收端分发：接收端先把路由配好（事件类型 `agent_task_handoff`，只接受回环地址），
+   然后用事件号跑分发器；不带参数就是全量分发：
 
    ```bash
    python scripts/agent_handoff_router.py <event-id>
@@ -90,7 +110,16 @@ register  ->  tick  ->  signed send  ->  webhook  ->  router  ->  verify
 投递目标是**回环限定**的：`AGENT_HANDOFF_URL` / `AGENT_HANDOFF_VERIFY_URL` 只接受
 `127.0.0.1` 或 `localhost`，公网地址会被拒绝——这是设计约束，不是缺省值。
 
-## 可选的 Hermes 适配器
+## 测试 Tests
+
+`tests/` 下 3 个测试文件：`test_handoff.py`（pytest）、`test_agent_routing.py` 与
+`test_webhook_hardening.py`（unittest）。跑全部测试：
+
+```bash
+python -m pytest tests/ -q   # 需先安装 pytest；pytest 会把两个 unittest 文件一起跑
+```
+
+## 可选的 Hermes 适配器 Optional Hermes adapters
 
 接收端分发器可以把结果送到两个通道，两个通道都由 Hermes 提供，**因此都是可选的**：
 
@@ -109,7 +138,7 @@ archive / verify-* / prune-claims`）照常可用。
 通道语义保持不变：`hermes send` 返回 rc 2 是永久错误，立即 `blocked`；超时和 rc 1 是
 瞬时错误，按 60/120/240/480/600 秒退避，五次之后 `blocked`。
 
-## 排错
+## 排错 Troubleshooting
 
 - **`ERROR: PI_HANDOFF_URL is set but AGENT_HANDOFF_URL is not ... renamed`**
   旧的 `PI_HANDOFF_*` 变量名已经全部改成 `AGENT_HANDOFF_*`，并且**不做兼容映射**。
@@ -132,7 +161,7 @@ archive / verify-* / prune-claims`）照常可用。
 - **裁决不会变**：已经写入 `verdict` 的事件再裁决会返回 rc 2，这是不可变契约；
   要改只能走 `verify-clear`。
 
-## 许可与状态
+## 许可 License
 
 MIT（见 `LICENSE`）。`data/`、`tmp/`、`review/`、真实配置文件 `agentwebhook.toml`、
 `.env`、`receipt*.json` 与 `*.key` 都在 `.gitignore` 里：这个仓库发布的是机制，不含任何
