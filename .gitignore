@@ -1,0 +1,39 @@
+# Runtime state: task registry, events, receipts, outbox, claims, archives.
+# It holds real session content and must never be published.
+data/
+
+# Scratch and test sandboxes (the test suite creates directories here).
+tmp/
+
+# Reference copies of another product's source. Never publish.
+.tmp-ref/
+
+# Working notes and review dumps.
+review/
+
+# Repair receipts written at the repository root by one-off runs.
+receipt*.json
+repair-receipt-*.json
+runtime-repair-receipt-*.json
+
+# Local configuration: the real file carries paths and the secret location.
+agentwebhook.toml
+.env
+
+# Signing keys and any credential material.
+*.key
+private.key
+secrets.json
+
+# Python build artefacts.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.codegraph/
+
+# Editor and OS noise.
+*.bak
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,140 @@
+# AgentWebhook
+
+一个给编码 Agent 用的**带签名回调（signed webhook）交付层**：注册一个正在跑的
+任务，读取它的会话文件，判断它是完成了、失败了还是卡住了，然后把这件事作为一条
+事件（event）签名后投递到接收端的 webhook，并在接收端回执（receipt）之后做二次校验。
+
+它解决的唯一问题是：**"我以为它还在跑"和"它其实已经停下"不能靠猜**。所有判断都来自
+会话文件里可读的记录，所有投递都有 HMAC 签名和回执可对账。
+
+## 架构
+
+```text
+register  ->  tick  ->  signed send  ->  webhook  ->  router  ->  verify
+(登记任务)   (读会话、   (HMAC 签名       (接收端      (按注册表    (二次校验、
+             生成事件)    POST 投递)      路由)         路由投递)    独立记账)
+```
+
+- **文件队列是唯一事实源**，HTTP 只是运输方式。数据根下的布局：`registry.json` 存任务，
+  `tasks/<task-id>/state.json` 存读取进度，`tasks/<task-id>/receipts/` 存回执原文，
+  `outbox/events/<event-id>.json` 是事件权威记录（先落盘再投递），
+  `outbox/claims/<event-id>` 是并发投递的独占标记，`outbox/acks.jsonl` 存主通道裁决，
+  `outbox/journal.jsonl` 是审计流水；校验通道另有 `outbox/verify/`、
+  `outbox/verify-claims/`、`outbox/verify-acks.jsonl`，与主通道分账。
+- `handoff.py` 是登记与投递端，19 个子命令：`register / unregister / tick / send /
+  status / claim / ack / ack-pending / clean / send-verify / release / defer /
+  verify-claim / verify-ack / verify-show / verify-open / verify-clear / archive /
+  prune-claims`。
+- `scripts/agent_handoff_router.py` 是接收端分发器：它**只读注册表**决定事件该去哪里，
+  请求体永远只有 `schema_version / task_id / event_id / status` 四个字段。
+- `scripts/agent_handoff_tick.sh` 是给调度器（cron 之类）用的包装：先 `tick` 再 `send`，
+  配置缺失就以非零退出，不吞错；投递地址、校验地址、密钥文件都在环境或配置文件里。
+- 仓库根目录的 `fake_receiver.py` 是一个只用于自验的假接收端（`--secret-file` 必需，
+  `--mode ok|500|badsig|redirect`），它同样只接受 `X-Event-Type: agent_task_handoff`。
+- 事件类型 `agent_task_handoff`；接收端路由 `/webhooks/agent-task-handoff` 与
+  `/webhooks/agent-task-handoff-verify`。签名头：`X-Event-Type`、`X-GitHub-Event`、
+  `X-Request-ID`（重试期间保持不变）、`X-Hub-Signature-256`。
+- 裁决（verdict）一经写入不可变；verify 通道单独记账，不与主通道混用。
+- 协议默认值是契约的一部分，不随机器改变：投递上限 60 次（`AGENT_HANDOFF_MAX_ATTEMPTS`），
+  停滞判定 3600 秒（`AGENT_HANDOFF_STALL_SECONDS`），单任务单轮最多读 262144 字节
+  （`AGENT_HANDOFF_MAX_BYTES`）与不限条数（`AGENT_HANDOFF_MAX_RECORDS` 缺省 0）；
+  分发器侧的重试退避 60/120/240/480/600 秒、独占租约 120 秒、陈旧锁 300 秒、
+  telegram 发送超时 45 秒、本地镜像超时 60 秒，都是编译期常量。
+
+## 快速开始
+
+1. 复制配置样例，填自己的值（两个样例等价，环境变量优先于配置文件）：
+
+   ```bash
+   cp config.example.toml agentwebhook.toml   # 或：source .env.example 后改值
+   ```
+
+   必填四项：`AGENT_HANDOFF_ROOT`（文件队列目录）、`AGENT_HANDOFF_URL`、
+   `AGENT_HANDOFF_VERIFY_URL`、`AGENT_HANDOFF_SECRET_FILE`（HMAC 密钥文件）。
+   配置解析顺序是**环境变量 → 配置文件 → 非零退出并报出缺哪个键**；任何一层都不会
+   落到某个开发者机器的路径上。配置文件默认名 `agentwebhook.toml`，放在 `handoff.py`
+   同目录，或用 `AGENT_HANDOFF_CONFIG` 指到别处。
+
+2. 登记一个正在跑的任务，并跑一轮判定与投递：
+
+   ```bash
+   python handoff.py register --task-id <task-id> \
+     --session-path <session-file> --workdir <project-dir> \
+     --goal "<这个任务要达成什么>" --pid <running-pid>
+   python handoff.py tick --max-bytes 262144
+   ```
+
+   `tick` 默认判完就投递，`--no-send` 只判定不入队投递；调度器一般直接跑
+   `scripts/agent_handoff_tick.sh`（它把 `tick` 与 `send` 串起来）。
+
+   只想看一眼整条链路，可以先起假接收端：
+
+   ```bash
+   python fake_receiver.py --port 8644 --secret-file <secret-file> --mode ok
+   ```
+
+3. 接收端把路由配到 `127.0.0.1`（事件类型 `agent_task_handoff`），然后用事件号跑分发器；
+   不带参数就是全量分发：
+
+   ```bash
+   python scripts/agent_handoff_router.py <event-id>
+   ```
+
+4. 校验链路（可选，需要 `AGENT_HANDOFF_VERIFY_URL`）：
+
+   ```bash
+   python handoff.py verify-open <event-id>     # 看还欠哪些校验
+   python handoff.py send-verify --url <verify-url> --secret-file <secret-file>
+   ```
+
+投递目标是**回环限定**的：`AGENT_HANDOFF_URL` / `AGENT_HANDOFF_VERIFY_URL` 只接受
+`127.0.0.1` 或 `localhost`，公网地址会被拒绝——这是设计约束，不是缺省值。
+
+## 可选的 Hermes 适配器
+
+接收端分发器可以把结果送到两个通道，两个通道都由 Hermes 提供，**因此都是可选的**：
+
+- **telegram**：需要 `AGENT_HANDOFF_HERMES_BIN`，用 `hermes send --to <origin> ...` 投递，
+  目标来自登记时的 `--origin-target`，形如 `telegram:1234567890` 或带话题号
+  `telegram:1234567890:1`（示例都是占位值，不是真实账号）。
+- **local**：需要 `AGENT_HANDOFF_HERMES_PYTHON` 与 `AGENT_HANDOFF_HERMES_AGENT_DIR`，
+  把消息镜像回发起会话；`local:<会话号>` 直接用，裸 `local` 需要
+  `AGENT_HANDOFF_LOCAL_SESSION` 给出会话号。
+
+没有配置适配器时**不会崩溃，也不会被当成业务失败**：事件已经到达 webhook 与文件队列，
+这一步仍然算成功；分发器会把该事件记为 `blocked` 并写明缺哪个键，核心命令
+（`register / unregister / tick / status / claim / ack / defer / release / clean /
+archive / verify-* / prune-claims`）照常可用。
+
+通道语义保持不变：`hermes send` 返回 rc 2 是永久错误，立即 `blocked`；超时和 rc 1 是
+瞬时错误，按 60/120/240/480/600 秒退避，五次之后 `blocked`。
+
+## 排错
+
+- **`ERROR: PI_HANDOFF_URL is set but AGENT_HANDOFF_URL is not ... renamed`**
+  旧的 `PI_HANDOFF_*` 变量名已经全部改成 `AGENT_HANDOFF_*`，并且**不做兼容映射**。
+  只要环境或配置文件里出现旧名而同名新名未设，任何命令都会非零退出并报出对应的新名。
+  按提示改名字即可，不要指望旧值生效。
+- **`no secret file given (--secret-file / $AGENT_HANDOFF_SECRET_FILE); refusing to
+  fall back to any default credential`**：签名密钥文件必须显式给出，程序不会猜测密钥。
+- **`send skipped: no receiver configured ($AGENT_HANDOFF_URL or --url)`**：没有接收端
+  配置，事件留在 outbox 里等待，`tick` 本身仍然成功。
+- **`{"result": "misconfigured", ...}`**：分发器缺 `AGENT_HANDOFF_DATA_ROOT` 或
+  `AGENT_HANDOFF_SCRIPT`，按上面补齐即可；它不会去扫描磁盘猜路径。
+- **`{"result": "blocked", "note": "hermes adapter is not configured; ...", ...}`**：
+  通道需要的 `AGENT_HANDOFF_HERMES_BIN` / `AGENT_HANDOFF_HERMES_PYTHON` /
+  `AGENT_HANDOFF_HERMES_AGENT_DIR` 没配，补齐后事件仍会按退避表重试。
+- **路由找不到 / 事件被拒**：确认接收端订阅的是 `agent_task_handoff`，路由名是
+  `/webhooks/agent-task-handoff`（校验通道是 `...-verify`），并且 `fake_receiver.py`
+  之类的手工接收端也按新事件名校验 `X-Event-Type`。
+- **lock busy**：分发器拿不到 `router.lock` 时输出 `"result": "lock_busy"` 并返回退出码
+  `0`——已有另一个分发在跑，这不是失败，调度器不应重试告警。
+- **裁决不会变**：已经写入 `verdict` 的事件再裁决会返回 rc 2，这是不可变契约；
+  要改只能走 `verify-clear`。
+
+## 许可与状态
+
+MIT（见 `LICENSE`）。`data/`、`tmp/`、`review/`、真实配置文件 `agentwebhook.toml`、
+`.env`、`receipt*.json` 与 `*.key` 都在 `.gitignore` 里：这个仓库发布的是机制，不含任何
+真实账号、会话、密钥或机器路径。配置样例与本文一律使用占位值
+（`<data-root>`、`<secret-file>`、`telegram:1234567890`）。

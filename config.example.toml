@@ -1,0 +1,80 @@
+# AgentWebhook configuration sample.
+#
+# Copy to agentwebhook.toml next to handoff.py (or point AGENT_HANDOFF_CONFIG at
+# it). Every key is also readable as an environment variable of the same name,
+# and the environment wins over this file.
+#
+# Resolution order for every key: environment variable -> this file -> the
+# program stops with a non-zero exit naming the missing key. Nothing here has a
+# fallback to a developer machine path.
+#
+# AGENT_HANDOFF_CONFIG is the only extra key: it points at this file itself and
+# has no default beyond "<directory of handoff.py>/agentwebhook.toml".
+
+# --- required: the recorder and the sender -------------------------------
+
+# Where the file queue lives (events, receipts, outbox, claims). Required: with
+# no value `handoff.py` stops and names this key; only the subcommand help text
+# still describes the <script dir>/data layout as the historical default.
+AGENT_HANDOFF_ROOT = "<data-root>"
+
+# Main completion-callback receiver URL. Loopback only (127.0.0.1 or localhost):
+# the sender refuses a routable address, that is a contract, not a default.
+# Required for sending; without it `tick` reports "send skipped" and keeps the
+# events pending instead of delivering them.
+AGENT_HANDOFF_URL = "http://127.0.0.1:8644/webhooks/agent-task-handoff"
+
+# Verify-channel receiver URL. Empty means the verify channel is off; a
+# non-empty value must also be loopback.
+AGENT_HANDOFF_VERIFY_URL = "http://127.0.0.1:8644/webhooks/agent-task-handoff-verify"
+
+# HMAC signing key file. Required for sending: no key file means the sender
+# refuses to fall back to any default credential.
+AGENT_HANDOFF_SECRET_FILE = "<secret-file>"
+
+# --- optional: protocol numbers (defaults are part of the contract) ------
+
+# Delivery attempts before an event is blocked. Default 60; the router's own
+# retry ladder (60/120/240/480/600 seconds, 5 steps) is compiled in.
+AGENT_HANDOFF_MAX_ATTEMPTS = "60"
+
+# Records read per task per tick. Default 0 means unlimited.
+AGENT_HANDOFF_MAX_RECORDS = "0"
+
+# Session bytes read per task per tick. Default 262144.
+AGENT_HANDOFF_MAX_BYTES = "262144"
+
+# Silence in seconds after which a running task is reported as stalled.
+# Default 3600.
+AGENT_HANDOFF_STALL_SECONDS = "3600"
+
+# --- optional: Hermes adapter (only needed when the adapter is enabled) ---
+
+# Path of the `hermes` executable used for telegram delivery
+# (`hermes send --to <origin> ...`). Unset means telegram delivery is blocked
+# with a note naming this key; the core commands keep working.
+AGENT_HANDOFF_HERMES_BIN = "<hermes-bin>"
+
+# Python interpreter that runs the local-session mirror. Unset means local
+# delivery is blocked with a note naming this key; the candidate glob that used
+# to scan a developer machine is gone on purpose.
+AGENT_HANDOFF_HERMES_PYTHON = "<hermes-python>"
+
+# Hermes agent directory the local mirror reads. Unset means local delivery is
+# blocked with a note naming this key.
+AGENT_HANDOFF_HERMES_AGENT_DIR = "<hermes-agent-dir>"
+
+# Local session id used when an event carries the bare `local` origin. Unset
+# means a bare `local` event stays unrouted with a reason naming this key; a
+# `local:<8-64 chars>` origin is used as-is.
+AGENT_HANDOFF_LOCAL_SESSION = "<local-session-id>"
+
+# --- optional: where the dispatcher finds the recorder -------------------
+
+# State directory the router drives. Required: with no value the router reports
+# `misconfigured` instead of scanning a machine.
+AGENT_HANDOFF_DATA_ROOT = "<data-root>"
+
+# handoff.py the router shells out to. Required: with no value the router
+# reports `misconfigured` instead of guessing a sibling checkout.
+AGENT_HANDOFF_SCRIPT = "<path-to>/handoff.py"
