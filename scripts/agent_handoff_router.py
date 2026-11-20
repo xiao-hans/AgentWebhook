@@ -180,22 +180,34 @@ PERMANENT_SEND_MARKERS = (
 # argv JSON -> helper snippet -> marker on stdout. Nothing is interpolated into a
 # shell command line: the payload travels as one argv element to a python -c script.
 MIRROR_SENTINEL = "HANDOFF_MIRROR="
-MIRROR_SNIPPET = (
-    "import json, sys\n"
-    "sys.path.insert(0, sys.argv[1])\n"
-    "p = json.loads(sys.argv[2])\n"
-    "try:\n"
-    "    from gateway.mirror import mirror_to_session\n"
-    "except Exception as e:\n"
-    "    print('HANDOFF_MIRROR=error:import: ' + repr(e)); sys.exit(3)\n"
-    "try:\n"
-    "    ok = mirror_to_session(p['channel'], p['session_key'], p['text'],\n"
-    "                           source_label='handoff-router', role='user',\n"
-    "                           session_id=p['session_id'])\n"
-    "except Exception as e:\n"
-    "    print('HANDOFF_MIRROR=error: ' + repr(e)); sys.exit(4)\n"
-    "print('HANDOFF_MIRROR=' + ('1' if ok else '0'))\n"
-)
+# P4-R1 B-1 (spec docs/spec/verify-lifecycle-sweep-20261119.md:103): ONE wake snippet for
+# both callers. The literal used to live here while handoff.py kept a second, mirror-only
+# copy, and the two drifted - the recorder could never wake a session the router could.
+# The single source is handoff.py:WAKE_SNIPPET. A router that cannot load the recorder
+# does NOT wake from a private copy: it defers the event as transient (fail-closed, picked
+# up on the next tick) instead of silently re-creating the divergence.
+def wake_snippet():
+    """The recorder's shared wake snippet, or None when handoff.py is not loadable."""
+    lib = _handoff_lib()
+    snippet = getattr(lib, "WAKE_SNIPPET", None) if lib is not None else None
+    return snippet if isinstance(snippet, str) and snippet.strip() else None
+
+
+def notify_notice_text(ev):
+    """§3.1/§3.4 notice body for a notification event, from the recorder's contract.
+
+    Returns None for a protocol status (report_ready and friends), which keeps the
+    completion wording and the verify-open queueing. Reading the status set and the
+    wording from handoff.py - instead of restating them here - is what keeps the two
+    sides from drifting again: a notice must never be phrased as a finished task.
+    """
+    lib = _handoff_lib()
+    if lib is None:
+        return None
+    if ev.get("status") not in getattr(lib, "VERIFY_NOTIFY_STATUSES", ()):
+        return None
+    formatter = getattr(lib, "notify_wake_text", None)
+    return formatter(ev) if callable(formatter) else None
 
 
 class FileLock:
@@ -424,6 +436,72 @@ def resolve_local_session(origin_target, task):
                   "or export AGENT_HANDOFF_LOCAL_SESSION")
 
 
+def resolve_telegram_target(origin_target):
+    """(chat_id, thread_id) for a telegram origin target - M-6.
+
+    A target carries its scheme: `telegram:-1001234567890:27` (group chat + topic) or
+    `telegram:-1001234567890` (plain chat). Splitting on the FIRST colon - as this file
+    used to - made chat_id the literal word `telegram` and thread_id the real chat id, so
+    the state.db lookup could never hit, the RPC wake never ran, and every telegram route
+    silently degraded to `hermes send`. Strip the scheme, then split what remains.
+    A target without the scheme is passed through unchanged (a bare chat id still works).
+    """
+    target = (origin_target or "").strip()
+    if target.lower().startswith("telegram:"):
+        target = target[len("telegram:"):].strip()
+    if ":" in target:
+        chat_id, thread_id = target.split(":", 1)
+        return chat_id.strip(), (thread_id.strip() or None)
+    return target, None
+
+
+def resolve_telegram_session(origin_target):
+    """(session_id, None) for a telegram target, or (None, why) when unresolvable or ambiguous.
+
+    Enforces fail-closed: checks Hermes state.db for active (ended_at IS NULL) telegram
+    sessions matching chat_id and optional thread_id. If multiple active sessions exist with
+    different session_keys, returns None and a reason to prevent cross-session pollution.
+    """
+    candidates = [
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "hermes", "state.db"),
+        os.path.join(os.path.expanduser("~"), ".hermes", "state.db"),
+    ]
+    db_path = next((p for p in candidates if os.path.isfile(p) and os.path.getsize(p) > 0), None)
+    if not db_path:
+        return None, "Hermes state.db 未找到"
+    try:
+        import sqlite3
+        con = sqlite3.connect(db_path)
+        cur = con.cursor()
+        chat_id, thread_id = resolve_telegram_target(origin_target)
+
+        if thread_id:
+            cur.execute("""
+                SELECT id, session_key, last_activity_at
+                FROM sessions
+                WHERE source = 'telegram' AND ended_at IS NULL AND chat_id = ? AND thread_id = ?
+                ORDER BY last_activity_at DESC
+            """, (chat_id, thread_id))
+        else:
+            cur.execute("""
+                SELECT id, session_key, last_activity_at
+                FROM sessions
+                WHERE source = 'telegram' AND ended_at IS NULL AND chat_id = ?
+                ORDER BY last_activity_at DESC
+            """, (chat_id,))
+        rows = cur.fetchall()
+        con.close()
+        if not rows:
+            return None, f"未找到 chat_id={chat_id} 的活跃 Telegram 会话"
+        if len(rows) > 1:
+            distinct_keys = {r[1] for r in rows}
+            if len(distinct_keys) > 1:
+                return None, f"Telegram 目标会话存在歧义 ({len(rows)} 活跃会话, keys={distinct_keys})"
+        return rows[0][0], None
+    except Exception as e:
+        return None, f"查询 Telegram 路由数据库失败: {e}"
+
+
 def deliver_local(hermes_python, hermes_agent_dir, origin_target, text, run, task=None):
     """Mirror into a local pi session through Hermes' own gateway helper.
 
@@ -435,9 +513,16 @@ def deliver_local(hermes_python, hermes_agent_dir, origin_target, text, run, tas
     session_id, why = resolve_local_session(origin_target, task)
     if session_id is None:
         return False, why or "transient: local session_id unresolved"
+    snippet = wake_snippet()
+    if snippet is None:
+        # B-1: no private copy of the wake contract. Without the recorder's snippet this
+        # process cannot know whether the text gets marked internal or lands as a user
+        # turn, so the event stays transient and the next tick retries - the alternative
+        # is the exact divergence that made the two sides disagree.
+        return False, "transient: recorder wake snippet unavailable"
     payload = {"channel": "local", "session_key": session_id,
                "text": text, "session_id": session_id}
-    argv = [hermes_python, "-c", MIRROR_SNIPPET, hermes_agent_dir,
+    argv = [hermes_python, "-c", snippet, hermes_agent_dir,
             json.dumps(payload, ensure_ascii=True)]
     try:
         res = run(argv, timeout=MIRROR_TIMEOUT)
@@ -650,12 +735,46 @@ def route_event(eid, ev, claim_data, task, handoff_base, hermes_bin, hermes_pyth
 
     agent_name = routing.get("agent_name") or "Agent"
     task_id = claim_data.get("task_id") or ev.get("task_id") or "?"
-    subject = f"[{agent_name} 进程退出回执] {task_id}"
     goal = task.get("goal") or "无描述"
-    body = (f"{agent_name} 进程已执行结束（待 Hermes 独立验收产物）。\n"
-            f"目标：{goal}\n事件ID：{eid}")
+    notice = notify_notice_text(ev)
+    if notice is not None:
+        # B-1: a notification status (verify_blocked / verify_stalled) is not a finished
+        # task. It carries the recorder's §3.1/§3.4 notice text, and it does NOT open a
+        # verify queue: handoff.py refuses verify-open for anything but report_ready, so
+        # calling it only wrote a refusal note beside an event that was already acked.
+        subject = f"[{agent_name} 验收通知] {task_id}"
+        body = notice
+    else:
+        subject = f"[{agent_name} 进程退出回执] {task_id}"
+        body = (f"{agent_name} 进程已执行结束（待 Hermes 独立验收产物）。\n"
+                f"目标：{goal}\n事件ID：{eid}")
+    is_notice = notice is not None
 
     if channel == "telegram":
+        # First attempt: direct Gateway RPC wake into original Telegram session if python adapter available
+        tg_sid, tg_err = resolve_telegram_session(origin_target)
+        snippet = wake_snippet()
+        if tg_sid and hermes_python and hermes_agent_dir and snippet:
+            payload = {"channel": "telegram", "session_key": tg_sid,
+                       "text": f"{subject}\n{body}", "session_id": tg_sid}
+            argv = [hermes_python, "-c", snippet, hermes_agent_dir,
+                    json.dumps(payload, ensure_ascii=True)]
+            try:
+                res = run(argv, timeout=MIRROR_TIMEOUT)
+                out = _out(res)
+                marker = next((line[len(MIRROR_SENTINEL):] for line in out.splitlines()
+                               if line.startswith(MIRROR_SENTINEL)), None)
+                if marker == "1" and int(getattr(res, "returncode", 1)) == 0:
+                    _ack(handoff_base, eid, "accepted", f"已通过 Gateway RPC 唤醒 Telegram 原会话 {origin_target} (sid: {tg_sid})",
+                         run, say, summary)
+                    summary["dispatched"].append({"event_id": eid, "channel": channel,
+                                                  "target": origin_target, "session_id": tg_sid, "method": "gateway_rpc"})
+                    if not is_notice:
+                        open_verify_queue(handoff_base, eid, run, say, summary)
+                    return "delivered via telegram gateway rpc"
+            except Exception as e:
+                say(f"Telegram Gateway RPC wake failed, falling back to hermes send: {e}")
+
         ok, detail, timed_out, rc = deliver_telegram(hermes_bin, origin_target, subject,
                                                     body, run)
         if ok:
@@ -663,7 +782,8 @@ def route_event(eid, ev, claim_data, task, handoff_base, hermes_bin, hermes_pyth
                  run, say, summary)
             summary["dispatched"].append({"event_id": eid, "channel": channel,
                                           "target": origin_target})
-            open_verify_queue(handoff_base, eid, run, say, summary)
+            if not is_notice:
+                open_verify_queue(handoff_base, eid, run, say, summary)
             return "delivered via telegram"
         if rc == 2:
             # Spec I9: exit 2 means the CLI refused the command itself, so no retry can
@@ -689,7 +809,8 @@ def route_event(eid, ev, claim_data, task, handoff_base, hermes_bin, hermes_pyth
              run, say, summary)
         summary["dispatched"].append({"event_id": eid, "channel": channel,
                                       "target": origin_target})
-        open_verify_queue(handoff_base, eid, run, say, summary)
+        if not is_notice:
+            open_verify_queue(handoff_base, eid, run, say, summary)
         return "delivered via local mirror"
     return _defer(handoff_base, eid, ev, f"本地镜像投递失败: {detail[:200]}",
                   run, say, summary)
@@ -728,6 +849,25 @@ def main(argv=None):
     summary = run_router(target_event_id=target,
                          log=lambda msg: print(msg, file=sys.stderr))
     print(json.dumps(summary, ensure_ascii=True))
+    # --- kanban-handoff sync hook: best-effort board projection ---------------
+    # Any crash, timeout or non-zero exit is logged only: the router's return
+    # value and its delivery path are untouched by design.
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        sync_script = setting("AGENT_HANDOFF_KANBAN_SYNC") or os.path.join(
+            here, "kanban_handoff_sync.py")
+        sync_python = setting(HERMES_PYTHON_KEY) or sys.executable
+        if os.path.isfile(sync_script):
+            sync = subprocess.run([sync_python, sync_script], timeout=120,
+                                  capture_output=True, text=True)
+            if sync.returncode:
+                print(f"kanban sync failed rc={sync.returncode}: "
+                      f"{(sync.stderr or '').strip()[:200]}", file=sys.stderr)
+        else:
+            print(f"kanban sync skipped: missing {sync_script}", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 - observation must not break delivery
+        print(f"kanban sync skipped: {type(exc).__name__}: {exc}", file=sys.stderr)
+    # --- end kanban-handoff sync hook -----------------------------------------
     # Spec V4: a router already holding the lock is the designed answer to an overlap, not
     # a failure. Returning non-zero there would make the cron wrapper report a broken
     # integration every time two passes meet.

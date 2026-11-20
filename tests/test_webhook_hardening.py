@@ -317,7 +317,11 @@ class VerifyChannelTests(BaseCase):
         eid = self.only_event("g1-syn")["event_id"]
         self.assertTrue(self.only_event("g1-syn")["synthetic"])
         rc, out = self.jcli("verify-open", eid)
-        self.assertEqual(rc, 2, out)
+        # M-5 SPEC-MANDATED ASSERTION CHANGE: rc 2 -> rc 3, per docs/spec/
+        # verify-lifecycle-sweep-20261119.md:127 ("3=无你的活（已核验/合成/未入队，
+        # 禁重试成立）", the same table listing `synthetic_not_queued(3)`) and §4.5. A
+        # drill is not a usage error: rc 2 told the caller to fix arguments and retry.
+        self.assertEqual(rc, 3, out)
         self.assertEqual(out["result"], "synthetic_not_queued")
         self.assertEqual(self.verify_doc(eid), {},
                          "a synthetic drill must never reach the verify Agent")
@@ -405,7 +409,15 @@ class VerifyChannelTests(BaseCase):
         rc, _ = self.cli("send", "--url", LOOPBACK, "--secret-file", SECRET_FILE,
                          "--verify-url", VERIFY_LOOPBACK)
         self.assertEqual(rc, 0)
-        self.assertEqual(self._delivery_id(), f"verify-{eid}-a1",
+        did = self._delivery_id()
+        self.assertIsNotNone(did)
+        # Spec §2.2 (2026-11-19): a retry id carries an attempt counter AND a
+        # per-send nonce, because two processes may resend the same attempt
+        # concurrently. DESIGN-REVIEW FLAG: this assertion previously demanded the
+        # exact f"verify-{eid}-a1"; the spec now mandates the nonce suffix, so the
+        # form is pinned by regex and the rotation itself stays proven by the
+        # assertNotEqual above. The contract is unchanged: every retry rotates.
+        self.assertRegex(did or "", rf"^verify-{eid}-a1-[0-9a-f]{{8}}$",
                          "a retry must carry a fresh id so the receiver re-fires")
         # and now the receiver actually accepts it
         self._echo_accept()
@@ -443,6 +455,70 @@ class VerifyChannelTests(BaseCase):
         self.assertEqual(rc, 0)
         self.assertEqual(self._verify_posts(), 2,
                          "a failed queue item leaves the queue (Major 2)")
+
+        # M-2: exhaustion of the HTTP attempts budget is a stall, not a silent failure.
+        # The sweep's sent-timeout and nack paths already announce it; this path must use
+        # the same reason and must stay idempotent (Invariant I2) across further sends.
+        stall = [e for e in self.events().values()
+                 if e.get("status") == "verify_stalled"]
+        self.assertEqual(len(stall), 1,
+                         f"budget exhaustion must produce exactly one notice: {stall}")
+        self.assertEqual(stall[0]["reason"], "verify budget exhausted", stall[0])
+        receipt = H.read_json(stall[0]["receipt_path"], {}) or {}
+        self.assertTrue(str(receipt.get("final_text", "")).endswith(f"event_id: {eid}"),
+                        f"the notice must name the source event it stall-descends from: "
+                        f"{receipt.get('final_text')!r}")
+        for _ in range(2):
+            self.cli("send", "--url", LOOPBACK, "--secret-file", SECRET_FILE,
+                     "--verify-url", VERIFY_LOOPBACK)
+        self.assertEqual(self._verify_posts(), 2,
+                         "a failed doc must not be POSTed to again")
+        self.assertEqual(len([e for e in self.events().values()
+                              if e.get("status") == "verify_stalled"]), 1,
+                         "the notice is derived from (task, status, reason, source id), "
+                         "so replaying the send cannot duplicate router traffic")
+
+    def test_m3_bad_verify_url_skips_only_the_verify_channel(self):
+        """M-3: a channel's misconfiguration is that channel's problem.
+
+        Before the fix, `send --verify-url <illegal>` aborted the whole pass (rc 2): the
+        report_ready event stayed pending, the queue doc stayed un-sent, and the notice
+        wake never ran. Spec §3.4 does not make waking a delivery step, so all three
+        behaviours are pinned here: origin delivered, verify skipped, notice woken.
+        """
+        self.register("m3-split")
+        self.write_receipt("m3-split", "report\n")
+        self.tick("m3-split")
+        eid = self.only_event("m3-split")["event_id"]
+        self._open_doc(eid)
+        # the notice that must still be woken, raised by the same helper M-2 uses
+        vdoc = self.verify_doc(eid)
+        notice, created = H._verify_notify_event(
+            self.root, vdoc, "verify_stalled", "verify budget exhausted",
+            f"boom\nevent_id: {eid}", int(time.time()))
+        self.assertTrue(created, notice)
+        nid = notice["event_id"]
+
+        woken = []
+
+        def record_wake(_root, ev, _now):
+            woken.append(ev["event_id"])
+            return 0
+
+        with mock.patch.object(H, "_router_wake", side_effect=record_wake):
+            rc, out = self.cli("send", "--url", LOOPBACK, "--secret-file", SECRET_FILE,
+                               "--verify-url", "http://example.com/nope")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.events()[eid]["state"], "delivered",
+                         "an illegal verify URL must not swallow the origin delivery: "
+                         + out)
+        self.assertEqual(self.verify_doc(eid)["verify_state"], "queued",
+                         "the queue doc stays open for the next pass")
+        urls = [c.args[0].full_url for c in self.opener.open.call_args_list]
+        self.assertFalse([u for u in urls if "example.com" in u], urls)
+        self.assertIn("verify channel skipped this pass", out)
+        self.assertIn(nid, woken,
+                      f"the notice wake is independent of delivery: {woken}")
 
     def test_verify_posts_never_touch_the_router_webhook_url(self):
         self.register("g1-urls")
@@ -584,16 +660,22 @@ class VerifyChannelTests(BaseCase):
         os.remove(H.p_verify(self.root, eid))
         rc, out = self.jcli("verify-ack", eid, "--verdict", "accepted")
         self.assertEqual(rc, 3, out)
-        self.assertEqual(out["result"], "not_queued",
-                         "without the script channel's dispatch there is nothing to judge")
+        # Spec §4.2 (2026-11-19): the doc vanished while the script channel's claim
+        # marker was live - that is a lost queue doc, not "never dispatched".
+        # DESIGN-REVIEW FLAG: previously asserted not_queued; §8-T2 mandates
+        # doc_missing_reopen + a verify-open repair hint. rc 3 ("no work") is intact.
+        self.assertEqual(out["result"], "doc_missing_reopen",
+                         "a lost doc under a live script claim must demand verify-open")
+        self.assertIn("verify-open", out["hint"], out)
         self.assertEqual(self._lines(H.p_verify_acks(self.root)), [])
 
     def test_verify_clear_drops_unacked_and_keeps_verdicted(self):
         ids = []
         for tid in ("g1-clr-a", "g1-clr-b"):
             self.register(tid)
-            self.write_receipt(tid, "report\n")
-            self.tick(tid)
+            self.write_receipt(tid, "short")
+            with mock.patch.object(H, "cmd_verify_drain", return_value=0):
+                self.tick(tid)
             eid = self.only_event(tid)["event_id"]
             ids.append(eid)
             self._open_doc(eid)
@@ -620,6 +702,80 @@ class VerifyChannelTests(BaseCase):
         self.assertEqual(rc, 0)
         self.assertEqual(out["cleared"], 0)
         self.assertEqual(out["absent"], [])
+
+    def test_verify_drain_accepts_matching_receipt_without_network(self):
+        self.register("g1-drain-ok")
+        self.write_receipt("g1-drain-ok", "report\n")
+        self.tick("g1-drain-ok")
+        eid = self.only_event("g1-drain-ok")["event_id"]
+        self._open_doc(eid)
+
+        def fail_network(*_args, **_kwargs):
+            raise AssertionError("local verification must not use the network")
+
+        with mock.patch.object(H, "send_verify_one", fail_network):
+            rc, out = self.jcli("verify-drain")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["accepted"], [eid])
+        self.assertEqual(out["blocked"], [])
+        self.assertEqual(self.verify_doc(eid), {})
+        ledger = self._lines(H.p_verify_acks(self.root))
+        self.assertEqual(ledger[-1]["event_id"], eid)
+        self.assertEqual(ledger[-1]["verdict"], "accepted")
+
+    def test_tick_drains_matching_verification_without_network(self):
+        tid = "tick-verify-local"
+        self.register(tid, extra=("--receipt-mode", "json"))
+        self.write_raw_receipt(tid, self.receipt_of(tid))
+        self.tick(tid)
+        eid = self.only_event(tid)["event_id"]
+        self.open_verify(eid)
+        self.tick(tid)
+        self.assertEqual(self.verify_doc(eid), {})
+        lines = self._lines(H.p_verify_acks(self.root))
+        self.assertEqual([x for x in lines if x.get("event_id") == eid][-1]["verdict"],
+                         "accepted")
+
+    def test_tick_runs_kanban_sync_after_verification(self):
+        tid = "tick-kanban-sync"
+        script = os.path.join(self.root, "sync.py")
+        marker = os.path.join(self.root, "sync-marker.txt")
+        with open(script, "w", encoding="utf-8") as handle:
+            handle.write(
+                "import os\n"
+                f"open({marker!r}, 'w', encoding='utf-8').write("
+                "os.environ['KANBAN_SYNC_LEDGER'])\n")
+        self.register(tid, extra=("--receipt-mode", "json"))
+        self.write_raw_receipt(tid, self.receipt_of(tid))
+        self.tick(tid)
+        eid = self.only_event(tid)["event_id"]
+        self.open_verify(eid)
+
+        with mock.patch.dict(os.environ, {"AGENT_HANDOFF_KANBAN_SYNC": script}):
+            self.tick(tid)
+
+        self.assertTrue(os.path.isfile(marker), "verification must trigger board sync")
+        with open(marker, encoding="utf-8") as handle:
+            self.assertEqual(os.path.realpath(handle.read()), os.path.realpath(self.root))
+
+    def test_verify_drain_blocks_missing_receipt_without_network(self):
+        self.register("g1-drain-bad")
+        self.write_receipt("g1-drain-bad", "report\n")
+        self.tick("g1-drain-bad")
+        eid = self.only_event("g1-drain-bad")["event_id"]
+        os.remove(self.receipt("g1-drain-bad"))
+        self._open_doc(eid)
+
+        def fail_network(*_args, **_kwargs):
+            raise AssertionError("local verification must not use the network")
+
+        with mock.patch.object(H, "send_verify_one", fail_network):
+            rc, out = self.jcli("verify-drain")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["accepted"], [])
+        self.assertEqual(out["blocked"], [eid])
+        ledger = self._lines(H.p_verify_acks(self.root))
+        self.assertEqual(ledger[-1]["verdict"], "blocked")
 
 class MultiAgentSourceTests(BaseCase):
     """Gap 2: more agent sources, three receipt modes, and Fix B's name contract."""
@@ -899,6 +1055,11 @@ class MultiAgentSourceTests(BaseCase):
         self.register("g2-force", "cursor", extra=("--receipt-mode", "json"))
         path = self.write_receipt("g2-force", json.dumps(
             {"task_id": "g2-force", "status": "report_ready"}))
+        # Spec §5.1/§5.2: --force now KEEPS a valid fresh unconsumed receipt. This
+        # fixture proves the deletion path, so the file is made genuinely stale
+        # (mtime below registered_at - 2). The assertions are unchanged.
+        _old = time.time() - 3600
+        os.utime(path, (_old, _old))
         rc, out = self.cli("register", "--task-id", "g2-force",
                            "--workdir", self.workdir, "--goal", "second run",
                            "--source", "cursor", "--receipt-mode", "json",
@@ -921,6 +1082,48 @@ class LocalRoutingTests(BaseCase):
                     "", "  local", "local:abcd1234efgh extra"):
             with self.assertRaises(ValueError, msg=bad):
                 H.validate_origin_target(bad)
+
+    def test_m1_session_id_and_local_target_length_bounds(self):
+        # M-1, Router ruling: {7,127} stays. A real desktop local session id is 76 chars
+        # (`local:local-<64hex>`), so reverting to {7,63} would break a wake chain that is
+        # already verified. The width therefore has to be pinned at its edges, and the
+        # refusal message must state the bound the regex actually enforces.
+        for n in (8, 64, 65, 128):
+            sid = "s" + "a" * (n - 1)
+            self.assertEqual(H.validate_session_id(sid), sid, f"session id {n} chars")
+            self.assertEqual(H.validate_origin_target(f"local:{sid}"), f"local:{sid}",
+                             f"local target with a {n}-char id")
+        too_long = "s" + "a" * 128                     # 129 chars
+        with self.assertRaises(ValueError) as first:
+            H.validate_session_id(too_long)
+        with self.assertRaises(ValueError):
+            H.validate_origin_target(f"local:{too_long}")
+        # the message must not quote a rule the code does not have (old text: "8-64")
+        self.assertIn("8-128", str(first.exception), str(first.exception))
+        # traversal: dots are legal inside an id, a `..` component never is
+        with self.assertRaises(ValueError):
+            H.validate_session_id("abcd..efgh")
+        with self.assertRaises(ValueError):
+            H.validate_origin_target("local:abcd..efgh")
+        for bad in ("local:../x", "local: abcd1234efgh", 'local:ab"cd1234efgh',
+                    "local:abcd1234efgh'", "local:abcd1234efgh\n"):
+            with self.assertRaises(ValueError, msg=bad):
+                H.validate_origin_target(bad)
+        # the production shape stays registerable end to end
+        rc, out = self.register("m1-76", "cursor", target=f"local:{'local-' + 'a' * 70}")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.task("m1-76")["origin_target"],
+                         f"local:{'local-' + 'a' * 70}")
+
+    def test_m1_router_resolve_local_session_does_not_truncate_long_ids(self):
+        # M-1 on the router side: a 65+ char id must reach session_key whole. A truncated
+        # id would ask Hermes to mirror into a session that never existed, and the wake
+        # would be refused as "本地目标会话不存在" instead of waking the desktop session.
+        for n in (65, 76, 128):
+            sid = "local-" + "a" * (n - len("local-"))
+            got, why = R.resolve_local_session(f"local:{sid}", {"session_id": "other"})
+            self.assertEqual(got, sid, f"{n}-char id must pass through intact: {got!r}")
+            self.assertIsNone(why)
 
     def test_register_accepts_local_target_and_routing_notifies_the_origin(self):
         # Spec G3-10: notify_telegram keeps its name but means "the script channel owes
@@ -1075,6 +1278,66 @@ class LocalRoutingTests(BaseCase):
                         "a delivered report is handed to the verifier by the same pass")
         self.assertEqual(self.verify_doc(eid)["claim_state"], "claimed_by_script")
 
+    def _fake_state_db(self, sid="tg-session-key-4211",
+                       chat_id="-1001234567890", thread_id="27"):
+        """A Hermes state.db in the temp root, with one active telegram session.
+
+        LOCALAPPDATA is redirected at it by the caller: the P4-R1 boundary forbids reading
+        real user sessions, and a fixed table also makes the lookup deterministic.
+        """
+        import sqlite3
+        base = os.path.join(self.root, "localappdata")
+        hdir = os.path.join(base, "hermes")
+        os.makedirs(hdir, exist_ok=True)
+        db = os.path.join(hdir, "state.db")
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE sessions (id TEXT, session_key TEXT, source TEXT,"
+                    " chat_id TEXT, thread_id TEXT, last_activity_at INTEGER,"
+                    " ended_at INTEGER)")
+        con.execute("INSERT INTO sessions VALUES (?,?,?,?,?,?,?)",
+                    (sid, sid, "telegram", chat_id, thread_id, int(time.time()), None))
+        con.commit()
+        con.close()
+        return base
+
+    def test_m6_telegram_target_parsing_strips_the_scheme(self):
+        # M-6: `telegram:-1001234567890:27` is scheme + chat + topic. Splitting on the
+        # first colon handed the literal word `telegram` to sqlite as chat_id, so the
+        # lookup always missed and the RPC wake never ran.
+        for target, want in ((TG_TARGET, ("-1001234567890", "27")),
+                             ("telegram:-1001234567890", ("-1001234567890", None)),
+                             ("telegram:12345", ("12345", None)),
+                             ("-1001234567890:27", ("-1001234567890", "27")),
+                             ("  telegram:-1001234567890:27  ",
+                              ("-1001234567890", "27"))):
+            self.assertEqual(R.resolve_telegram_target(target), want, target)
+        self.assertNotEqual(R.resolve_telegram_target(TG_TARGET)[0], "telegram")
+
+    def test_m6_telegram_wake_goes_through_the_gateway_rpc(self):
+        # M-6 red-before-fix: with chat_id='telegram' nothing resolved, so this case fell
+        # through to `hermes send` and test_router_sends_telegram_through_hermes_send
+        # stayed green while the intended wake channel was dead. A session that resolves
+        # must be woken by RPC with that exact session id and must not degrade.
+        base = self._fake_state_db()
+        eid = self.make_delivered_event("g3-r-tg-rpc", target=TG_TARGET)
+        fake = FakeRun(mirror_marker="1")
+        with mock.patch.dict(os.environ, {"LOCALAPPDATA": base}):
+            summary = self.run_router(fake, eid)
+        dispatched = summary["dispatched"]
+        self.assertEqual([d["channel"] for d in dispatched], ["telegram"], summary)
+        self.assertEqual(dispatched[0]["method"], "gateway_rpc", dispatched[0])
+        self.assertEqual(dispatched[0]["session_id"], "tg-session-key-4211", dispatched[0])
+        rpc = [a for a in fake.calls if len(a) > 1 and a[1] == "-c"]
+        self.assertEqual(len(rpc), 1, fake.calls)
+        payload = json.loads(rpc[0][4])
+        self.assertEqual(payload["channel"], "telegram", payload)
+        self.assertEqual(payload["session_key"], "tg-session-key-4211", payload)
+        self.assertEqual(payload["session_id"], "tg-session-key-4211", payload)
+        self.assertFalse([a for a in fake.calls if len(a) > 1 and a[1] == "send"],
+                         "a resolvable telegram session must not fall back to hermes send")
+        self.assertEqual(self.events()[eid]["verdict"], "accepted")
+        self.assertIn("Gateway RPC", self._ack_note(eid))
+
     def test_router_blocks_immediately_on_hermes_send_usage_error(self):
         # Spec I9: exit 2 is the CLI refusing the command before it sent anything, so the
         # retry ladder cannot heal it. It is graded before the stderr marker text, which
@@ -1100,6 +1363,52 @@ class LocalRoutingTests(BaseCase):
         path = H.p_acks(self.root)
         with open(path, encoding="utf-8") as f:
             return [json.loads(x) for x in f if x.strip()][-1]["note"]
+
+    def test_b1_both_sides_use_the_same_wake_snippet(self):
+        # P4-R1 B-1 (spec docs/spec/verify-lifecycle-sweep-20261119.md:103): the recorder
+        # and the router must wake through ONE snippet. The suite used to fake
+        # subprocess.run with a canned HANDOFF_MIRROR=1, so both sides could drift and
+        # every case stayed green. This compares the real text each side hands to
+        # `python -c` and pins the RPC-first contract the router had / the recorder lacked.
+        router_snippet = R.wake_snippet()
+        self.assertTrue(router_snippet, "router must resolve a wake snippet")
+        self.assertEqual(router_snippet, H.WAKE_SNIPPET)
+        self.assertEqual(H.MIRROR_SNIPPET, H.WAKE_SNIPPET)   # compatibility alias
+        for needle in ("session.resume", "prompt.submit",
+                       "_mark_internal_notification", "gateway.mirror"):
+            self.assertIn(needle, router_snippet)
+        with open(_ROUTER_PATH, encoding="utf-8") as f:
+            router_src = f.read()
+        self.assertNotIn("import asyncio, json, sys, uuid", router_src,
+                         "the router must not keep a second copy of the snippet")
+
+    def test_b1_notice_status_sends_notice_text_and_skips_verify_open(self):
+        # B-1: verify_blocked / verify_stalled are notices, not finished work. They must
+        # carry the recorder's notice wording and must not call verify-open, which
+        # handoff.py refuses for any status but report_ready (result not_report_ready).
+        prefixes = {"verify_stalled": ("verify-stalled", "验收预算耗尽"),
+                    "verify_blocked": ("verify-blocked", "请派发返修")}
+        for status, (prefix, tail) in prefixes.items():
+            with self.subTest(status=status):
+                eid = self.make_delivered_event("b1" + status.title().replace("_", ""))
+                self.patch_event(eid, status=status, reason="verify budget exhausted")
+                fake = FakeRun(mirror_marker="1")
+                summary = self.run_router(fake, eid)
+                self.assertEqual([d["channel"] for d in summary["dispatched"]],
+                                 ["local"], summary)
+                self.assertEqual(summary["verify_queued"], [],
+                                 f"a {status} notice must not open a verify queue")
+                self.assertFalse(
+                    any("verify-open" in " ".join(map(str, a)) for a in fake.calls),
+                    fake.calls)
+                texts = [json.loads(a[-1])["text"] for a in fake.calls
+                         if len(a) > 1 and a[1] == "-c"
+                         and str(a[-1]).startswith('{"channel": "local"')]
+                self.assertTrue(
+                    any(f"{prefix} {eid} task=" in t and tail in t for t in texts),
+                    f"notice must carry {prefix} wording, got {texts!r}")
+                self.assertFalse(any("\u8fdb\u7a0b\u5df2\u6267\u884c\u7ed3\u675f" in t for t in texts),
+                                 f"a notice must never read as completion: {texts!r}")
 
 
 class FakeRun:
@@ -1869,7 +2178,9 @@ class ReceiptRepairR1Tests(BaseCase):
         self.assertIs(st["pid_status"], False)
         self.assertNotIn("pid_alive", st, "one liveness key, not two")
 
-    # -- F5 (Minor): --force clears the previous run's receipt files ------------
+    # -- R1-f5 (Spec §5.1/§5.2): --force KEEPS a valid unconsumed receipt; the
+    # deletion path is proven by backdating the mtime below, so this fixture's
+    # exit.json stays INVALID (no task_id match) and is legitimately cleared.
     def test_r1_force_clears_external_receipt_paths(self):
         ext = os.path.join(self.root, "external")
         os.makedirs(ext)
@@ -1878,13 +2189,16 @@ class ReceiptRepairR1Tests(BaseCase):
         self.register("r1-f5", "cursor", extra=("--receipt-mode", "json",
                                                 "--session-path", receipt,
                                                 "--exit-code-path", exit_file))
-        # written immediately before the re-registration: inside the 2s mtime grace
-        # window of _receipt_is_stale, so deletion is the only thing that saves the
-        # next run from reporting a verdict for a task that never re-ran
+        # spec §5.1: --force deletes only STALE receipts, so both files are
+        # backdated below the 2s grace window; deletion is what saves the next
+        # run from reporting a verdict for a task that never re-ran
         self.write_raw_receipt("r1-f5", self.receipt_of("r1-f5"), key="session_path")
         with open(exit_file, "w", encoding="utf-8") as f:
             f.write(json.dumps({"exit_code": 0, "finished_at": int(time.time())}))
         self.assertTrue(os.path.isfile(receipt) and os.path.isfile(exit_file))
+        _old = time.time() - 3600
+        os.utime(receipt, (_old, _old))
+        os.utime(exit_file, (_old, _old))
 
         rc, out = self.cli("register", "--task-id", "r1-f5",
                            "--workdir", self.workdir, "--goal", "second run",
@@ -1960,6 +2274,10 @@ class ReceiptRepairR3Tests(BaseCase):
             f.write(json.dumps({"schema_version": 1, "task_id": tid, "exit_code": 0,
                                 "status": "report_ready", "report_text": "stale run",
                                 "finished_at": int(time.time())}))
+        # §5.1 keeps fresh valid receipts; backdate so this control really tests
+        # the deletion side of the guard (assertions unchanged)
+        _old = time.time() - 3600
+        os.utime(stale_receipt, (_old, _old))
 
         rc, out = self.force_register(tid, "cursor", ("--receipt-mode", "json"))
         self.assertEqual(rc, 0, out)
@@ -2011,6 +2329,10 @@ class ReceiptRepairR3Tests(BaseCase):
         self.assertEqual(rc, 0, out)
         with open(shared, "w", encoding="utf-8") as f:
             f.write(self.receipt_of("r3-shared"))
+        # §5.1: a fresh valid receipt is now KEPT; this control shows the shared
+        # report==receipt file still goes when genuinely stale (assertion intact)
+        _old = time.time() - 3600
+        os.utime(shared, (_old, _old))
         rc, out = self.force_register("r3-shared", "cursor",
                                       ("--receipt-mode", "json", "--report-path", shared))
         self.assertEqual(rc, 0, out)
@@ -2033,6 +2355,601 @@ class ReceiptRepairR3Tests(BaseCase):
                       "F1: one registered_at and one receipt must stay one event")
         self.assertEqual(len(self.events_for(tid)), 1, str(self.events_for(tid)))
         self.assertEqual(self.only_event(tid)["event_id"], event_id)
+
+
+class VerifySweepP2Tests(VerifyChannelTests):
+    """Spec §8 falsification suite T1–T15 (verify-lifecycle-sweep 2026-11-19).
+
+    Deliberately overlaps VerifyChannelTests: every case maps to one §8 acceptance
+    row, so a regression is attributable to a spec item rather than to a phrasing.
+    Fully offline: HTTP is the mocked opener, and the clock is aged by rewriting
+    the stored stamps the sweep reads (§8 allows exactly this). AGENT_HANDOFF_*
+    env is read only where a case names it (the §11.3 wake trio); BaseCase's
+    patch.dict restores everything on cleanup.
+    """
+
+    NOTE3 = ("needs_input: yes\ngap: which retry budget applies to phase 3\n"
+             "options: keep 60 | lower to 20")
+
+    def setUp(self):
+        super().setUp()
+        # the §11.3 degrade path must be explicit, never inherited from the host
+        for key in ("AGENT_HANDOFF_ROUTER_TARGET", "AGENT_HANDOFF_HERMES_PYTHON",
+                    "AGENT_HANDOFF_HERMES_AGENT_DIR"):
+            os.environ.pop(key, None)
+
+    # -- shared drivers ------------------------------------------------------
+    def _cli_root(self, root, *args):
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(out):
+            try:
+                rc = H.main(["--root", root, *args])
+            except SystemExit as exc:  # argparse exits; handoff.py returns codes
+                rc = exc.code
+        return rc, out.getvalue()
+
+    def _json_out(self, rc_out):
+        rc, out = rc_out
+        for line in reversed(out.strip().splitlines()):
+            try:
+                return rc, json.loads(line)
+            except ValueError:
+                continue
+        self.fail(f"no json line in output: {out!r}")
+
+    def _sent_doc(self, tid):
+        """Drive one event to the §1 queue doc in state sent (attempts 1)."""
+        rc, _ = self.register(tid)
+        self.assertEqual(rc, 0)
+        self.write_receipt(tid, f"complete final report body for {tid} " * 5)
+        self.tick(tid)
+        event_id = self.only_event(tid)["event_id"]
+        self._open_doc(event_id)
+        self._echo_accept()
+        rc, out = self.cli("send", "--url", LOOPBACK, "--secret-file", SECRET_FILE,
+                           "--verify-url", VERIFY_LOOPBACK)
+        self.assertEqual(rc, 0, out)
+        doc = self.verify_doc(event_id)
+        self.assertEqual(doc["verify_state"], "sent", doc)
+        self.assertEqual(doc["attempts"], 1, doc)
+        return event_id, doc
+
+    def _age(self, event_id, key, secs):
+        """Backdate one doc stamp; the sweep reads stored clocks, not time.time."""
+        doc = self.verify_doc(event_id)
+        doc[key] = int(time.time()) - secs
+        H.write_json_atomic(H.p_verify(self.root, event_id), doc)
+        return doc
+
+    def _send(self):
+        rc, out = self.cli("send", "--url", LOOPBACK, "--secret-file", SECRET_FILE,
+                           "--verify-url", VERIFY_LOOPBACK)
+        self.assertEqual(rc, 0, out)
+        return out
+
+    def _events_by(self, **fields):
+        return [e for e in self.events().values()
+                if all(e.get(key) == val for key, val in fields.items())]
+
+    def _append_aged_ledger_copy(self, row, secs):
+        """§11.1: the ledger is append-only, so an aged verdict is a copied row."""
+        aged = dict(row)
+        aged["at"] = int(time.time()) - secs
+        H.append_jsonl(H.p_verify_acks(self.root), aged)
+        return aged
+
+    def _force_register(self, tid, goal="second run"):
+        """--force re-registration; returns (registered echo dict, raw output)."""
+        rc, out = self.cli("register", "--task-id", tid, "--workdir", self.workdir,
+                           "--goal", goal, "--source", "cursor",
+                           "--origin-target", TG_TARGET, "--force")
+        self.assertEqual(rc, 0, out)
+        lines = [line for line in out.splitlines()
+                 if line.startswith("registered ")]
+        self.assertEqual(len(lines), 1, out)
+        return json.loads(lines[0][len("registered "):]), out
+
+    def _blocked_ack(self, event_id, note, claimer="verifier-a"):
+        rc, out = self.jcli("verify-ack", event_id, "--verdict", "blocked",
+                            "--note", note, "--claimer", claimer)
+        self.assertEqual(rc, 0, out)
+        return out
+
+    # -- T1: wrong --root must not be mistaken for an unknown event ----------
+    def test_t1_wrong_root_gets_the_did_you_mean_rc4(self):
+        # §4.2 / §8-T1: a project dir that *contains* a state root must be a hard
+        # config error (rc4 + hint), never a silent unknown_event (rc1).
+        project = os.path.join(self.root, "project")
+        os.makedirs(os.path.join(project, "data", "outbox"))
+        rc, out = self._cli_root(project, "verify-show", "evtT1aaaaaaaaaaaaaaaa")
+        self.assertEqual(rc, 4, out)
+        _, data = self._json_out((rc, out))
+        self.assertEqual(data["result"], "invalid_root", data)
+        self.assertIn("did you mean", data["hint"], data)
+        self.assertIn(os.path.join(project, "data"), data["hint"], data)
+
+    # -- T2: doc missing while the script channel holds the claim -------------
+    def test_t2_missing_doc_with_live_script_claim_reopens(self):
+        # §4.2 / §8-T2: doc_missing_reopen + verify-open hint, not not_queued.
+        tid = "gT2"
+        rc, _ = self.register(tid)
+        self.assertEqual(rc, 0)
+        self.write_receipt(tid, "complete final report body for gT2 " * 5)
+        self.tick(tid)
+        event_id = self.only_event(tid)["event_id"]
+        self._open_doc(event_id)
+        os.remove(H.p_verify(self.root, event_id))
+        rc, out = self.jcli("verify-ack", event_id, "--verdict", "accepted",
+                            "--note", "looks fine")
+        self.assertEqual(rc, 3, out)
+        self.assertEqual(out["result"], "doc_missing_reopen", out)
+        self.assertIn("verify-open", out["hint"], out)
+        self.assertEqual(self._lines(H.p_verify_acks(self.root)), [],
+                         "a refused ack must not touch the ledger")
+        # the hint must be executable: verify-open recreates the queue doc and a
+        # fresh ack then lands normally (reopen-recoverability, §7.2)
+        rc, out = self.jcli("verify-open", event_id)
+        self.assertEqual(rc, 0, out)
+        doc = self.verify_doc(event_id)
+        self.assertEqual(doc["verify_state"], "queued", doc)
+        rc, out = self.jcli("verify-ack", event_id, "--verdict", "accepted",
+                            "--note", "looks fine")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(len(self._lines(H.p_verify_acks(self.root))), 1)
+
+    # -- T3: aged sent doc with no claim/verdict is requeued and resent -------
+    def test_t3_aged_sent_doc_requeued_and_resent_in_the_same_pass(self):
+        # §6.1 / §8-T3: the sweep flips sent→queued (attempts +1) before
+        # load_events, so ONE send pass both requeues and redelivers.
+        eid, _ = self._sent_doc("gT3")
+        self._age(eid, "sent_at", 901)
+        out = self._send()
+        self.assertIn("sweep: requeued 1", out, out)
+        doc = self.verify_doc(eid)
+        self.assertEqual(doc["verify_state"], "sent", doc)
+        self.assertEqual(doc["attempts"], 3, doc)  # 1 + sweep + resend
+        self.assertEqual(doc["history"][-2]["action"], "verify_stale_requeue", doc)
+        self.assertEqual(self._verify_posts(), 2, out)
+
+    # -- T4: a live verifier lease stops the sweep -----------------------------
+    def test_t4_live_verify_lease_skips_the_sweep(self):
+        # §1.1 / §8-T4: claimed-but-unjudged inside the lease is honest work, not
+        # staleness. The doc keeps its stamps and no extra POST happens.
+        eid, _ = self._sent_doc("gT4")
+        self._age(eid, "sent_at", 901)
+        rc, out = self.jcli("verify-claim", eid, "--claimer", "verifier-b",
+                            "--lease-seconds", "600")
+        self.assertEqual(rc, 0, out)
+        out2 = self._send()
+        self.assertNotIn("requeued", out2, out2)
+        doc2 = self.verify_doc(eid)
+        self.assertEqual(doc2["attempts"], 1, doc2)
+        self.assertEqual(doc2["verify_state"], "sent", doc2)
+        self.assertEqual(doc2["history"][-1]["action"], "sweep_aborted", doc2)
+        self.assertEqual(doc2["history"][-1]["reason"], "claim", doc2)
+        self.assertEqual(self._verify_posts(), 1, out2)
+
+    # -- M-4: the live-lease abort is recorded once, not every tick -----------
+    def test_m4_live_lease_records_the_abort_once(self):
+        "# NOTE3: synthetic lease clock, no real verifier process."
+        # §8-T4 only ever drove one tick, so it could not see the defect: the sweep
+        # appended `sweep_aborted` per tick and rewrote the doc, which breaks Invariant
+        # I2 (idempotence) and makes the sweep a second writer of a doc it does not own.
+        eid, _ = self._sent_doc("gT4b")
+        self._age(eid, "sent_at", 901)
+        rc, out = self.jcli("verify-claim", eid, "--claimer", "verifier-b",
+                            "--lease-seconds", "600")
+        self.assertEqual(rc, 0, out)
+        self._send()
+        path = H.p_verify(self.root, eid)
+        doc1 = self.verify_doc(eid)
+        self.assertEqual(doc1["history"][-1]["action"], "sweep_aborted", doc1)
+        self.assertEqual(doc1["history"][-1]["review_sent_at"], doc1["sent_at"], doc1)
+        lines1 = len(doc1["history"])
+        with open(path, "rb") as f:
+            bytes1 = f.read()
+        for _ in range(3):
+            self._send()
+        doc3 = self.verify_doc(eid)
+        self.assertEqual(len(doc3["history"]), lines1, doc3["history"])
+        self.assertEqual(len([h for h in doc3["history"]
+                             if h.get("action") == "sweep_aborted"]), 1, doc3["history"])
+        self.assertEqual(doc3["verify_state"], "sent", doc3)
+        self.assertEqual(doc3["attempts"], 1, doc3)
+        self.assertEqual(self._verify_posts(), 1, "a live lease still means no resend")
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), bytes1,
+                             "three further ticks must not change one byte of the doc")
+
+    # -- T5: aged sent doc without a lease burns budget and goes failed -------
+    def test_t5_exhausted_stale_flow_wakes_the_origin(self):
+        # §6.1+§3.2 / §8-T5: failed carries a verify_stalled *event*, the only
+        # origin wake channel; reason is the fixed "verify budget exhausted".
+        eid, _ = self._sent_doc("gT5")
+        doc = self._age(eid, "sent_at", 901)
+        doc["max_attempts"] = 2
+        H.write_json_atomic(H.p_verify(self.root, eid), doc)
+        out = self._send()
+        self.assertNotIn("sweep: requeued 1", out, out)
+        doc2 = self.verify_doc(eid)
+        self.assertEqual(doc2["verify_state"], "failed", doc2)
+        stalled = self._events_by(status="verify_stalled",
+                                  reason="verify budget exhausted")
+        self.assertEqual(len(stalled), 1, out)
+        self.assertEqual(stalled[0]["task_id"], "gT5", stalled[0])
+        self.assertEqual(
+            stalled[0]["event_id"],
+            H.make_event_id("gT5", "verify_stalled", "verify budget exhausted", eid),
+            "the source event id is the notify event's report_fp/dedup key")
+
+    # -- T6: a blocked verdict creates exactly one notify event ----------------
+    def test_t6_blocked_ack_creates_one_deduped_notify_event(self):
+        # §3.2 / §8-T6: the verdict event is created once, keyed by
+        # (task, status, fixed reason, source event id); a late replay is refused.
+        eid, _ = self._sent_doc("gT6")
+        out = self._blocked_ack(eid, "retry semantics differ from spec")
+        self.assertEqual(out["notify_event_created"], True, out)
+        expected = H.make_event_id("gT6", "verify_blocked",
+                                   "verify verdict blocked", eid)
+        self.assertEqual(out["notify_event"], expected, out)
+        events = self._events_by(status="verify_blocked",
+                                 reason="verify verdict blocked")
+        self.assertEqual(len(events), 1, events)
+        rc, out2 = self.jcli("verify-ack", eid, "--verdict", "blocked",
+                             "--note", "again")
+        self.assertEqual(rc, 2, out2)  # verdict cannot be overwritten
+        self.assertEqual(len(self._events_by(status="verify_blocked")), 1)
+
+    # -- T7: the notify event id IS the dedup key ------------------------------
+    def test_t7_notify_event_id_is_the_dedup_key(self):
+        eid, _ = self._sent_doc("gT7")
+        out = self._blocked_ack(eid, "ambiguous budget")
+        first_id = out["notify_event"]
+        self.assertTrue(out["notify_event_created"], out)
+        # direct replay of the notify path (same task/status/reason/report_fp)
+        # must return the existing event instead of duplicating it:
+        again = H._verify_notify_event(self.root,
+                                       {"event_id": eid, "task_id": "gT7"},
+                                       "verify_blocked", "verify verdict blocked",
+                                       "replay attempt", int(time.time()))
+        self.assertIs(again[1], False, "a replayed notify must not be created")
+        self.assertEqual(again[0]["event_id"], first_id)
+        self.assertEqual(len(self._events_by(status="verify_blocked")), 1)
+
+    # -- T8: forced reregistration KEEPS a valid unconsumed receipt ------------
+    def test_t8_force_keeps_valid_unconsumed_receipt(self):
+        # §5.2 / §8-T8: deletion is limited to stale files; a fresh, matching,
+        # unconsumed receipt survives --force and its count is echoed.
+        tid = "gT8"
+        rc, _ = self.register(tid)
+        self.assertEqual(rc, 0)
+        path = self.write_receipt(tid, "complete body for the keep case " * 10)
+        prev = self.task(tid)["registered_at"]
+        echo, out = self._force_register(tid)
+        self.assertEqual(echo.get("kept"), 1, echo)
+        self.assertEqual(echo.get("stale_cleared"), 0, echo)
+        self.assertIn("KEEP:", out, out)
+        self.assertTrue(os.path.isfile(path), out)
+        self.assertGreaterEqual(self.task(tid)["registered_at"], prev)
+        # §5.2 保留路径下不重扫: the kept receipt must NOT leak into the new run -
+        # the watcher re-arms from the fresh registered_at onward only.
+        self.tick(tid)
+        self.assertEqual(self.events_for(tid), [],
+                         "a kept receipt must not be re-scanned by the next tick")
+        # §5.2 line 162: the watermark must not swallow THIS run's own answer -
+        # a receipt written after the keep is consumed normally.
+        self.write_receipt(tid, f"new run answer for {tid} " * 5)
+        self.tick(tid)
+        self.assertEqual(len(self.events_for(tid)), 1,
+                         "a receipt newer than the kept watermark is this run's")
+
+    # -- T9: stale receipts are still cleared by --force -----------------------
+    def test_t9_force_still_clears_stale_receipts(self):
+        tid = "gT9"
+        rc, _ = self.register(tid)
+        self.assertEqual(rc, 0)
+        path = self.write_receipt(tid, "stale body for the clear case " * 10)
+        stamp = self.task(tid)["registered_at"] - 10
+        os.utime(path, (stamp, stamp))
+        echo, out = self._force_register(tid)
+        self.assertEqual(echo.get("stale_cleared"), 1, echo)
+        self.assertEqual(echo.get("kept"), 0, echo)
+        self.assertIn("cleared stale receipt", out, out)
+        self.assertFalse(os.path.isfile(path), out)
+
+    # -- T10: a duplicate on the VERIFY channel is not a delivery --------------
+    def test_t10_verify_channel_duplicate_rotates_and_resends(self):
+        # §2.3/§2.2 / §8-T10: correlated duplicate ⇒ accepted=False, attempts +1,
+        # the retry rotates the did to -a{N}-{nonce8}, and the ledger stays empty.
+        eid, _ = self._sent_doc("gT10")
+        first_did = self._delivery_id()
+        rc, out = self.jcli("verify-clear", "--event-id", eid,
+                            "--reason", "unit: back to queued for the dup case")
+        self.assertEqual(rc, 0, out)
+        self._respond(json.dumps({"status": "duplicate",
+                                  "delivery_id": first_did}).encode())
+        rc, out = self.jcli("verify-open", eid)
+        self.assertEqual(rc, 0, out)
+        out2 = self._send()
+        doc = self.verify_doc(eid)
+        self.assertEqual(doc["verify_state"], "queued", doc)
+        self.assertEqual(doc["attempts"], 1, doc)
+        self.assertIn("gateway deduped", out2, out2)
+        self.assertEqual(self._delivery_id(), first_did,
+                         "the dup POST itself reuses the did; rotation is for retries")
+        self.assertEqual(self._lines(H.p_verify_acks(self.root)), [], out2)
+        self._echo_accept()
+        out3 = self._send()
+        did = self._delivery_id()
+        self.assertIsNotNone(did)
+        self.assertNotEqual(did, first_did, out3)
+        self.assertRegex(did or "", rf"^verify-{eid}-a1-[0-9a-f]{{8}}$", did)
+        self.assertEqual(self.verify_doc(eid)["verify_state"], "sent", out3)
+
+    # -- T11: a nack releases the claim and never writes a verdict -------------
+    def test_t11_verify_nack_releases_lease_without_verdict(self):
+        # §4.1 / §8-T11: sent→nacked, nack_count++, claim marker gone, no ledger row.
+        eid, _ = self._sent_doc("gT11")
+        rc, out = self.jcli("verify-claim", eid, "--claimer", "verifier-c",
+                            "--lease-seconds", "600")
+        self.assertEqual(rc, 0, out)
+        rc, out = self.jcli("verify-nack", eid, "--reason", "report truncated")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["result"], "nacked", out)
+        self.assertEqual(out["nack_count"], 1, out)
+        self.assertEqual(out["claim_marker"], "released", out)
+        doc = self.verify_doc(eid)
+        self.assertEqual(doc["verify_state"], "nacked", doc)
+        self.assertEqual(doc["nack_count"], 1, doc)
+        self.assertNotIn("verdict", doc, doc)
+        self.assertEqual(self._lines(H.p_verify_acks(self.root)), [],
+                         "a nack must never write the ledger")
+        self.assertFalse(os.path.exists(H.p_verify_claim(self.root, eid)),
+                         "nack must release the verifier lease")
+        rc, out = self.jcli("verify-nack", eid, "--reason", "double nack")
+        self.assertEqual(rc, 2, out)
+        self.assertEqual(out["result"], "illegal_transition", out)
+        self.assertEqual(self.verify_doc(eid)["nack_count"], 1,
+                         "a rejected nack must be inert")
+
+    # -- T12: the nack window requeues; the third nack burns the budget --------
+    def test_t12_nack_window_then_budget_wakes_origin(self):
+        # §6.2+§3.2 / §8-T12: nacked_at + window elapsed ⇒ requeue and resend;
+        # nack_count >= 3 ⇒ failed + exactly one origin wake (verify_stalled).
+        eid, _ = self._sent_doc("gT12")
+        for round_no in (1, 2, 3):
+            rc, out = self.jcli("verify-nack", eid,
+                                "--reason", f"reject #{round_no}")
+            self.assertEqual(rc, 0, out)
+            doc = self.verify_doc(eid)
+            self.assertEqual(doc["nack_count"], round_no, doc)
+            self._age(eid, "nacked_at", 301)
+            self._send()  # window elapsed → queued → resent in the same pass
+        doc = self.verify_doc(eid)
+        self.assertEqual(doc["verify_state"], "failed", doc)
+        self.assertEqual(doc["nack_count"], 3, doc)
+        self.assertTrue(doc["last_error"].startswith("nack budget exhausted: 3 nacks"),
+                        doc)
+        stalled = self._events_by(status="verify_stalled",
+                                  reason="verify budget exhausted")
+        self.assertEqual(len(stalled), 1, stalled)
+
+    # -- T13: sweep vs. verdict race — the verdict wins ------------------------
+    def test_t13_sweep_and_verdict_race_verdict_wins(self):
+        # §7.4 / §8-T13: a verdict that landed in the ledger must survive even a
+        # resurrected aged sent doc; the sweep skips it, silently and totally.
+        eid, _ = self._sent_doc("gT13")
+        self._blocked_ack(eid, "decided before the sweep")
+        rows = self._lines(H.p_verify_acks(self.root))
+        self._append_aged_ledger_copy(rows[-1], 901)  # no marker → no escalation
+        now = int(time.time())
+        H.write_json_atomic(H.p_verify(self.root, eid), {
+            "event_id": eid, "task_id": "gT13", "verify_state": "sent",
+            "sent_at": now - 901, "attempts": 1, "max_attempts": 60,
+            "created_at": now - 2000, "history": []})
+        out = self._send()
+        self.assertNotIn("requeued 1", out, out)
+        doc = self.verify_doc(eid)
+        self.assertEqual(doc["verify_state"], "sent",
+                         "a verdicted event must be left completely alone")
+        self.assertEqual(self._events_by(status="verify_stalled"), [], out)
+        self.assertEqual(len(self._events_by(status="verify_blocked")), 1, out)
+        self.assertEqual(self._events_by(reason=H.VERIFY_ESCALATION_REASON), [], out)
+        self.assertEqual(self._lines(H.p_verify_escalations(self.root)), [], out)
+
+    # -- T14: unknown event at a real state root is plain rc1 -------------------
+    def test_t14_unknown_event_gets_rc1_not_the_root_hint(self):
+        rc, out = self.jcli("verify-show", "evtUnknown000000000")
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(out["result"], "unknown_event", out)
+        self.assertNotIn("hint", out, out)
+
+    # -- T15: the §11 needs_input escalation, end to end ------------------------
+    def test_t15_aged_needs_input_escalates_once_distinguishably(self):
+        eid, _ = self._sent_doc("gT15")
+        out = self._blocked_ack(eid, self.NOTE3)
+        verdict_event = out["notify_event"]
+        rows = self._lines(H.p_verify_acks(self.root))
+        raw_last = rows[-1]
+        self.assertIn("gap:", raw_last["note"], raw_last)  # the whole note is kept
+        self.assertNotIn("gap", [k for k in raw_last if k != "note"],
+                         "no new ledger fields may appear (§11.1)")
+        # not aged yet: one more send must NOT escalate
+        self._send()
+        self.assertEqual(self._events_by(reason=H.VERIFY_ESCALATION_REASON), [])
+        self._append_aged_ledger_copy(raw_last, 901)
+        out2 = self._send()
+        self.assertIn("sweep: escalated 1", out2, out2)
+        esc = self._events_by(status="verify_blocked",
+                              reason=H.VERIFY_ESCALATION_REASON)
+        self.assertEqual(len(esc), 1, out2)
+        # distinguishable from the §3.2 verdict event, both coexist
+        self.assertEqual(len(self._events_by(status="verify_blocked")), 2, out2)
+        self.assertNotEqual(esc[0]["event_id"], verdict_event)
+        self.assertEqual(
+            esc[0]["event_id"],
+            H.make_event_id("gT15", "verify_blocked",
+                            H.VERIFY_ESCALATION_REASON, eid),
+            "report_fp=original event id is the escalation's dedup key")
+        final_text = H.read_json(esc[0]["receipt_path"], {})["final_text"]
+        self.assertIn("task: gT15 goal: hardening goal", final_text)
+        self.assertIn("gap: which retry budget applies to phase 3", final_text)
+        self.assertIn("options: keep 60 | lower to 20", final_text)
+        self.assertIn(f"original_event: {eid}", final_text)
+        dedup = self._lines(H.p_verify_escalations(self.root))
+        self.assertEqual(len(dedup), 1, out2)
+        self.assertEqual(dedup[0]["event_id"], eid, dedup)
+        self.assertEqual(dedup[0]["notify_event_id"], esc[0]["event_id"], dedup)
+        ledger_rows = self._lines(H.p_verify_acks(self.root))
+        # replay: a second escalation must not happen; the ledger stays append-only
+        out3 = self._send()
+        self.assertEqual(len(self._events_by(reason=H.VERIFY_ESCALATION_REASON)),
+                         1, out3)
+        self.assertEqual(self._lines(H.p_verify_escalations(self.root)), dedup,
+                         out3)
+        self.assertEqual(len(self._lines(H.p_verify_acks(self.root))),
+                         len(ledger_rows), out3)
+        # §11.3 cmd_status red item: the needs_input row carries the gap
+        reds = [r for r in H._verify_status_rows(self.root, "gT15")
+                if r.get("red")]
+        self.assertTrue(any(r.get("verify_state") == "needs_input_blocked"
+                            and "which retry budget" in str(r.get("last_error"))
+                            for r in reds), reds)
+
+    def test_t15b_no_router_target_degrades_to_origin_only(self):
+        # §11.3 / T15: unset ROUTER_TARGET ⇒ origin notification still delivered,
+        # escalation still created, no wake file, zero exceptions.
+        eid, _ = self._sent_doc("gT15b")
+        self._blocked_ack(eid, self.NOTE3)
+        rows = self._lines(H.p_verify_acks(self.root))
+        self._append_aged_ledger_copy(rows[-1], 901)
+        out2 = self._send()
+        self.assertIn("sweep: escalated 1", out2, out2)
+        esc = self._events_by(reason=H.VERIFY_ESCALATION_REASON)
+        self.assertEqual(len(esc), 1, out2)
+        self.assertEqual(esc[0]["state"], "delivered", esc[0])  # origin woken
+        self.assertFalse(os.path.exists(os.path.join(H.p_wakes_dir(self.root),
+                                                     esc[0]["event_id"] + ".json")),
+                         "no wake file without a router target")
+
+    def test_t15c_local_router_gets_the_needs_input_wake(self):
+        # §11.3 wake-text contract: "needs-input <原event_id> task=<task_id> …"
+        # over the same one-shot local wake channel the blocked notify uses.
+        eid, _ = self._sent_doc("gT15c")
+        self._blocked_ack(eid, self.NOTE3)
+        rows = self._lines(H.p_verify_acks(self.root))
+        self._append_aged_ledger_copy(rows[-1], 901)
+        seen = []
+
+        def fake_run(argv, *args, **kwargs):
+            seen.append(argv)
+            return SimpleNamespace(returncode=0, stdout="HANDOFF_MIRROR=1\n",
+                                   stderr="")
+
+        with mock.patch.dict(os.environ, {
+                "AGENT_HANDOFF_ROUTER_TARGET": LOCAL_TARGET,
+                "AGENT_HANDOFF_HERMES_PYTHON": sys.executable,
+                "AGENT_HANDOFF_HERMES_AGENT_DIR": self.workdir}), \
+             mock.patch.object(H.subprocess, "run", side_effect=fake_run):
+            out2 = self._send()
+        self.assertIn("sweep: escalated 1", out2, out2)
+        esc = self._events_by(reason=H.VERIFY_ESCALATION_REASON)
+        self.assertEqual(len(esc), 1, out2)
+        texts = [json.loads(a[-1])["text"] for a in seen
+                 if a and a[-1].startswith('{"channel": "local"')]
+        self.assertTrue(any(t.startswith(f"needs-input {eid} task=gT15c")
+                            and "已超龄" in t for t in texts),
+                        f"wake must name the ORIGINAL event id (§11.3): {texts!r}")
+        self.assertTrue(all(not t.startswith("needs-input")
+                            or t.startswith(f"needs-input {eid}") for t in texts),
+                        texts)
+        self.assertTrue(os.path.exists(os.path.join(H.p_wakes_dir(self.root),
+                                                    esc[0]["event_id"] + ".json")),
+                        texts)
+
+    def test_b1_failed_wake_retries_next_tick_until_the_cap(self):
+        # B-1: a refused wake used to write the same once-per-event marker as a success,
+        # so one failed attempt - a restarting gateway, a session that exists a minute
+        # later - silenced the notice forever. Failures now journal separately and the
+        # next tick retries, bounded by WAKE_MAX_ATTEMPTS; only success writes the marker.
+        ev = {"event_id": "wake-fail-1", "task_id": "gB1w", "status": "verify_stalled",
+              "reason": "verify budget exhausted", "receipt_path": None}
+        calls = []
+
+        def fail_run(argv, *args, **kwargs):
+            calls.append(argv)
+            return SimpleNamespace(returncode=1, stdout="HANDOFF_MIRROR=0\n", stderr="")
+
+        env = {"AGENT_HANDOFF_ROUTER_TARGET": LOCAL_TARGET,
+               "AGENT_HANDOFF_HERMES_PYTHON": sys.executable,
+               "AGENT_HANDOFF_HERMES_AGENT_DIR": self.workdir}
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.object(H.subprocess, "run", side_effect=fail_run):
+            for tick in range(H.WAKE_MAX_ATTEMPTS):
+                self.assertFalse(H._router_wake(self.root, ev, 1000 + tick * 60),
+                                 "a failed wake must report failure")
+            self.assertFalse(H._router_wake(self.root, ev, 2000),
+                             "the retry cap must stop forking a subprocess")
+        self.assertEqual(len(calls), H.WAKE_MAX_ATTEMPTS,
+                         f"every tick until the cap must attempt the wake: {len(calls)}")
+        self.assertFalse(os.path.exists(os.path.join(H.p_wakes_dir(self.root),
+                                                     "wake-fail-1.json")),
+                         "a failed wake must not write the permanent marker")
+        with open(H.wake_attempt_path(self.root, "wake-fail-1"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["attempts"], H.WAKE_MAX_ATTEMPTS)
+
+        # success is still exactly once per event (the marker dedups a replayed send)
+        ev_ok = dict(ev, event_id="wake-ok-1")
+
+        def ok_run(argv, *args, **kwargs):
+            return SimpleNamespace(returncode=0, stdout="HANDOFF_MIRROR=1\n", stderr="")
+
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.object(H.subprocess, "run", side_effect=ok_run):
+            self.assertTrue(H._router_wake(self.root, ev_ok, 3000))
+            self.assertFalse(H._router_wake(self.root, ev_ok, 3060),
+                             "a successful wake must not repeat")
+        self.assertTrue(os.path.isfile(os.path.join(H.p_wakes_dir(self.root),
+                                                    "wake-ok-1.json")))
+
+    def test_t15d_escalation_is_one_shot_and_read_only(self):
+        # §11.3 invariants: no attempts consumption, no requeue, no second
+        # escalation, no failed transition, ledger rows byte-identical.
+        eid, _ = self._sent_doc("gT15d")
+        self._blocked_ack(eid, self.NOTE3)
+
+        def ledger_bytes():
+            with open(H.p_verify_acks(self.root), "rb") as f:
+                return f.read()
+
+        raw_before = ledger_bytes()
+        rows = self._lines(H.p_verify_acks(self.root))
+        self._append_aged_ledger_copy(rows[-1], 901)
+        raw_aged = ledger_bytes()
+        self.assertTrue(raw_aged.startswith(raw_before),
+                        "escalation inputs are appended, never rewritten")
+        self._send()
+        self.assertEqual(ledger_bytes(), raw_aged,
+                         "the ledger stays read-only (§11.1)")
+        for _ in range(3):
+            self._send()
+        self.assertEqual(len(self._events_by(reason=H.VERIFY_ESCALATION_REASON)), 1)
+        self.assertEqual(len(self._lines(H.p_verify_escalations(self.root))), 1)
+        # the verdict doc is gone; nothing was swept, so no failed/stalled state
+        self.assertFalse(os.path.exists(H.p_verify(self.root, eid)))
+        self.assertEqual(self._events_by(status="verify_stalled"), [])
+
+    def test_t15e_marker_is_honored_not_inferred(self):
+        # §11.2: a blocked verdict WITHOUT the needs_input marker escalates never;
+        # free text "blocked" is not a request for instructions.
+        eid, _ = self._sent_doc("gT15e")
+        self._blocked_ack(eid, "the design is wrong, redo it")
+        rows = self._lines(H.p_verify_acks(self.root))
+        self._append_aged_ledger_copy(rows[-1], 901)
+        out = self._send()
+        self.assertNotIn("escalated", out, out)
+        self.assertEqual(self._events_by(reason=H.VERIFY_ESCALATION_REASON), [])
+        self.assertEqual(self._lines(H.p_verify_escalations(self.root)), [])
 
 
 if __name__ == "__main__":

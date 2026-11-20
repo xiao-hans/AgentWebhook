@@ -1836,7 +1836,12 @@ def t13_renamed_settings():
         check(f"{old} error says the name was renamed", "renamed" in out, out[:200])
     check("every key in the list is a renamed AGENT_ setting",
           all(k.startswith("AGENT_HANDOFF_") for k in H.ENV_KEYS)
-          and len(H.ENV_KEYS) == 15, str(H.ENV_KEYS)[:220])
+          # SPEC-MANDATED (P4-R1 M-7): this was pinned at 15 while the §6 sweep
+          # work added the five keys of
+          # docs/spec/verify-lifecycle-sweep-20261119.md §9 (:213-219 -
+          # VERIFY_SENT_TIMEOUT, VERIFY_SWEEP_MAX, VERIFY_NACK_TIMEOUT,
+          # VERIFY_NACK_MAX, ROUTER_TARGET). 20 is the spec's key surface.
+          and len(H.ENV_KEYS) == 20, str(H.ENV_KEYS)[:220])
 
     # (a2) the shipped samples cover exactly that list, so code and docs cannot
     # drift apart: every key but the pointer itself, and nothing extra.

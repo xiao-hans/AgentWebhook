@@ -26,10 +26,13 @@ import contextlib
 import hashlib
 import hmac
 import http.client
+import io
 import json
 import os
 import re
+import secrets
 import shutil
+import subprocess
 import sys
 import time
 
@@ -46,9 +49,9 @@ EVENT_TYPE = "agent_task_handoff"
 PROTOCOL_STATUSES = ("report_ready", "stopped_unfinished", "failed", "stalled")
 
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{7,63}$")
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$")
 ORIGIN_TARGET_RE = re.compile(
-    r"telegram:[+-]?[1-9][0-9]*(?::[1-9][0-9]*)?|local|local:[A-Za-z0-9][A-Za-z0-9._-]{7,63}"
+    r"telegram:[+-]?[1-9][0-9]*(?::[1-9][0-9]*)?|local|local:[A-Za-z0-9][A-Za-z0-9._-]{7,127}"
 )
 SOURCE_CHOICES = ("pi", "claude", "receipt", "exit", "cursor", "codex", "dsh")
 RECEIPT_FAMILY_SOURCES = ("receipt", "exit", "cursor", "codex", "dsh")
@@ -81,6 +84,114 @@ MAX_TIMELINE = 50
 MAX_TEXT_FIELDS = 2000
 MAX_RESPONSE_BYTES = 64 * 1024
 RETRYABLE_STATUS = (408, 429, 500, 502, 503, 504)
+
+# the verify lifecycle's own notification statuses (Spec §3.1): they travel the event
+# outbox like any terminal notice but deliberately stay outside PROTOCOL_STATUSES, so
+# no scanner can emit one and open_verify_doc still refuses everything but
+# report_ready. Widening this tuple is the ONLY way a non-protocol status enters.
+VERIFY_NOTIFY_STATUSES = ("verify_blocked", "verify_stalled")
+# Spec §11.3: the escalation notice reuses verify_blocked, and only this fixed
+# reason keeps its event_id distinct from the §3.2 "verify verdict blocked"
+# notice for the same source event (make_event_id hashes task/status/reason/fp).
+VERIFY_ESCALATION_REASON = "needs_input escalation"
+# §11.2 structured-note trigger; the contract demands the line first, the sweep
+# accepts it anywhere in the note (a marker is a marker).
+NEEDS_INPUT_MARKER = "needs_input:"
+
+# §3.4 router wake-up (Spec docs/spec/verify-lifecycle-sweep-20261119.md:103): the
+# argv-JSON -> python -c wake contract, ONE copy for both sides of the handoff.
+# P4-R1 B-1: this constant is the single source. scripts/agent_handoff_router.py no
+# longer carries its own literal - it imports this module and passes THIS string to
+# its subprocess, so the recorder and the router cannot drift apart again. It is a
+# constant here (not an import of the router) because the recorder must be able to
+# wake the router without the router process being alive at sweep time.
+MIRROR_SENTINEL = "HANDOFF_MIRROR="
+WAKE_SNIPPET = (
+    "import asyncio, json, sys, uuid\n"
+    "sys.path.insert(0, sys.argv[1])\n"
+    "p = json.loads(sys.argv[2])\n"
+    "sid = p.get('session_id') or p.get('session_key')\n"
+    "text = p.get('text')\n"
+    "from gateway.run_notifications import _mark_internal_notification\n"
+    "marked_text = _mark_internal_notification(text)\n"
+    "sub_id = 'handoff-wake-' + uuid.uuid4().hex[:12]\n"
+    "async def _wake():\n"
+    "    from hermes_cli.gateway_client import connect_gateway\n"
+    "    async with connect_gateway() as client:\n"
+    "        await client.rpc('session.resume', session_id=sid, omit_messages=True)\n"
+    "        return await client.rpc('prompt.submit', session_id=sid, submission_id=sub_id, text=marked_text)\n"
+    "try:\n"
+    "    asyncio.run(_wake())\n"
+    "    print('HANDOFF_MIRROR=1')\n"
+    "except Exception as e:\n"
+    "    # Fallback to mirror_to_session when gateway socket is unavailable\n"
+    "    try:\n"
+    "        from gateway.mirror import mirror_to_session\n"
+    "        ok = mirror_to_session(p['channel'], p['session_key'], p['text'],\n"
+    "                               source_label='handoff-router', role='user',\n"
+    "                               session_id=p['session_id'])\n"
+    "        print('HANDOFF_MIRROR=' + ('1' if ok else '0'))\n"
+    "    except Exception as e2:\n"
+    "        print('HANDOFF_MIRROR=error: ' + repr(e) + ' | fallback: ' + repr(e2))\n"
+    "        sys.exit(4)\n"
+)
+# Kept as an alias: the wake went from mirror-only to gateway-RPC-first, and every
+# existing call site (and the tests' argv seam) still names the mirror sentinel.
+MIRROR_SNIPPET = WAKE_SNIPPET
+MIRROR_TIMEOUT = 60
+# P4-R1 B-1: a FAILED wake is not a closed matter. Only success writes the
+# once-per-event marker under outbox/wakes/; a failure is journaled to
+# outbox/wakes-attempted/ so the next tick may retry, and WAKE_MAX_ATTEMPTS caps how
+# often it may fail before the notice is left to the red status line instead of
+# spawning a subprocess every tick forever.
+WAKE_MAX_ATTEMPTS = 3
+
+
+def notify_wake_text(ev):
+    """§3.4 the wake line for one notification event - shared by both sides (B-1).
+
+    The recorder calls it in _router_wake; the router calls it in route_event, so the
+    wording a blocked/stalled notice carries cannot differ between the two channels.
+    Content is read only from the local event document (never from a remote body).
+    """
+    eid = ev.get("event_id", "")
+    tid = ev.get("task_id") or "?"
+    status = ev.get("status")
+    if status == "verify_blocked":
+        if ev.get("reason") == VERIFY_ESCALATION_REASON:
+            # §11.3: an aged needs_input gap goes to the front desk for a decision,
+            # not for a rework dispatch - and never for a resume of the old session.
+            # The spec pins the ORIGINAL event id into the wake text; resolve it from
+            # the notification's own receipt (local file, never a remote fetch).
+            orig = eid
+            rec = read_json(ev.get("receipt_path") or "", None) or {}
+            m = re.search(r"^original_event: (\S+)$", rec.get("final_text") or "",
+                          re.MULTILINE)
+            if m:
+                orig = m.group(1)
+            return (f"needs-input {orig} task={tid} "
+                    "\u5df2\u8d85\u9f84 \u2192 \u8bf7\u524d\u53f0\u51b3\u7b56")
+        return (f"verify-blocked {eid} task={tid} "
+                "\u2192 \u8bf7\u6d3e\u53d1\u8fd4\u4fee")
+    return (f"verify-stalled {eid} task={tid} "
+            "\u2192 \u9a8c\u6536\u9884\u7b97\u8017\u5c3d\uff0c\u9700\u4eba\u5de5\u4ecb\u5165")
+
+
+def wake_attempt_path(root, event_id):
+    """The non-terminal failure record for one wake (B-1: retryable, not a marker)."""
+    return os.path.join(root, "outbox", "wakes-attempted", event_id + ".json")
+
+# Spec §7.1, the legal verify_state transitions (a write outside this table is a
+# bug or a forged call sequence: it is refused, never "repaired"). queued->acked
+# is in the table although §7.1 lists sent->acked, because the shipped suite locks
+# a verifier judging a doc it fetched by hand (test_verify_ack_* x3); the deviation
+# is flagged in the Phase 2 report for design sign-off.
+LEGAL_VERIFY_TRANSITIONS = (
+    ("queued", "sent"), ("queued", "queued"), ("queued", "failed"), ("queued", "acked"),
+    ("sent", "queued"), ("sent", "nacked"), ("sent", "acked"), ("sent", "failed"),
+    ("nacked", "queued"), ("nacked", "failed"),
+    ("failed", "queued"),  # manual verify-open --max-attempts only (open_verify_doc)
+)
 
 # ---------------------------------------------------------------------------
 # configuration
@@ -121,6 +232,11 @@ ENV_KEYS = (
     "AGENT_HANDOFF_HERMES_BIN",
     "AGENT_HANDOFF_HERMES_PYTHON",
     "AGENT_HANDOFF_HERMES_AGENT_DIR",
+    "AGENT_HANDOFF_VERIFY_SENT_TIMEOUT",
+    "AGENT_HANDOFF_VERIFY_SWEEP_MAX",
+    "AGENT_HANDOFF_VERIFY_NACK_TIMEOUT",
+    "AGENT_HANDOFF_VERIFY_NACK_MAX",
+    "AGENT_HANDOFF_ROUTER_TARGET",
 )
 
 _CONFIG_CACHE = {}
@@ -303,6 +419,16 @@ def p_verify_acks(root):
     return os.path.join(root, "outbox", "verify-acks.jsonl")
 
 
+def p_verify_escalations(root):
+    """Append-only §11.3 dedupe file; the sweep path is its only writer (I1)."""
+    return os.path.join(root, "outbox", "verify-escalations.jsonl")
+
+
+def p_wakes_dir(root):
+    """§3.4 one-shot router wake-up markers (one file per notify event attempted)."""
+    return os.path.join(root, "outbox", "wakes")
+
+
 def p_archive(root):
     return os.path.join(root, "archive", "registry-archive.json")
 
@@ -433,9 +559,16 @@ def validate_task_id(tid):
 
 
 def validate_session_id(sid):
-    """Entry-boundary only: a claude session id is trusted once, at registration."""
-    if not SESSION_ID_RE.match(sid or ""):
-        raise ValueError(f"invalid session_id {sid!r} (need [A-Za-z0-9._-], start alnum, 8-64 chars)")
+    """Entry-boundary only: a claude session id is trusted once, at registration.
+
+    M-1: the message used to promise "8-64 chars" while SESSION_ID_RE/ORIGIN_TARGET_RE
+    allow 8-128, so a rejected id quoted a rule the code never enforced. The bound named
+    here is the bound in the regex, and the `..` component is refused for the same reason
+    validate_task_id refuses it: a session id is one path-shaped token, never a traversal.
+    """
+    if not SESSION_ID_RE.match(sid or "") or ".." in (sid or ""):
+        raise ValueError(f"invalid session_id {sid!r} "
+                         "(need [A-Za-z0-9._-], start alnum, 8-128 chars, no '..')")
     return sid
 
 
@@ -446,10 +579,11 @@ def validate_agent_name(name):
 
 
 def validate_origin_target(target):
-    if not isinstance(target, str) or not ORIGIN_TARGET_RE.fullmatch(target):
+    if not isinstance(target, str) or not ORIGIN_TARGET_RE.fullmatch(target) \
+            or ".." in target:
         raise ValueError("origin_target must be telegram:<signed-decimal-chat-id>"
                          "[:<positive-thread-id>], 'local', or 'local:<session-id>' "
-                         "(no whitespace or extra fields)")
+                         "(no whitespace, no '..', no extra fields)")
     return target
 
 
@@ -948,7 +1082,7 @@ def build_receipt(root, task, st, status, reason, final_text, now, eid, text_tru
 
 def create_event(root, task, st, status, reason, final_text, now, report_fp=None,
                  text_truncated=False):
-    if status not in PROTOCOL_STATUSES:
+    if status not in PROTOCOL_STATUSES + VERIFY_NOTIFY_STATUSES:
         raise ValueError(f"illegal status {status!r}")
     tid = task["task_id"]
     eid = make_event_id(tid, status, reason, report_fp)
@@ -1209,6 +1343,70 @@ def _receipt_is_stale(path, registered_at):
         return False
 
 
+def _receipt_consumed(root, tid, mtime, report_fp):
+    """True when a terminal event demonstrably built from this receipt exists (§5.1).
+
+    Two independent proofs: a task terminal event created at or around the receipt's
+    mtime (the tick that read it - the same 2s grace _receipt_is_stale uses), or an
+    archived receipt whose final_text still hashes to this file's report_fp, which
+    survives even a clock skew. Nothing else counts: a receipt nobody consumed is the
+    run's only answer, and deleting it would erase a verdict before it reached the
+    ledger.
+    """
+    if not tid:
+        return False
+    hashable = isinstance(report_fp, str) and _sha256_hex(report_fp)
+    for ev in load_events(root).values():
+        if ev.get("task_id") != tid or ev.get("status") not in RECEIPT_STATUSES:
+            continue
+        if int(ev.get("created_at") or 0) >= int(mtime) - 2:
+            return True
+        if hashable and ev.get("receipt_path"):
+            r = read_json(ev["receipt_path"], None)
+            ft = r.get("final_text") if isinstance(r, dict) else None
+            if (isinstance(ft, str)
+                    and hashlib.sha256(ft.encode("utf-8")).hexdigest() == report_fp.lower()):
+                return True
+    return False
+
+
+def _receipt_is_valid(root, prev_entry, path):
+    """Spec §5.1: a previous run's receipt that `register --force` must NOT delete.
+
+    The deletion sweep was built for the stale case and once --force became a routine
+    re-arm its blast radius swallowed a receipt whose verdict had not been consumed
+    yet (chain ⑤). "Valid" is a conjunction: fresh (mtime at or after the previous
+    registration), attributable (json mode names the same task), and unconsumed (no
+    terminal event was built from it, and the incremental reader has not walked past
+    it). Marker/exitcode receipts keep the mtime+consumption judgement; attribution
+    for them would re-implement the marker parser here, and the ledger-side proof
+    above is the one that actually protects the verdict.
+    """
+    try:
+        mtime = os.path.getmtime(path)
+        size = os.path.getsize(path)
+    except OSError:
+        return False
+    if size == 0 or mtime < int(prev_entry.get("registered_at") or 0):
+        return False
+    tid = prev_entry.get("task_id")
+    report_fp = None
+    if (prev_entry.get("receipt_mode") or DEFAULT_RECEIPT_MODE) == "json":
+        raw, err = _read_receipt_file(path)
+        if err or raw is None:
+            return False
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return False
+        if not isinstance(data, dict) or data.get("task_id") != tid:
+            return False
+        report_fp = data.get("report_fp")
+    if _receipt_consumed(root, tid, mtime, report_fp):
+        return False
+    return not (tid and int(load_state(root, tid).get("offset") or 0) >= size)
+
+
 def _int_field(data, key):
     val = data.get(key)
     if isinstance(val, bool) or not isinstance(val, int):
@@ -1400,6 +1598,13 @@ def scan_task_receipt(root, task, st):
         return (None, waiting, "")
     if _receipt_is_stale(path, registered_at):
         return reject("mtime precedes registered_at")
+    kept_before = float(task.get("kept_receipt_mtime") or 0)
+    if kept_before and os.path.getmtime(path) <= kept_before:
+        # Spec §5.2: register --force kept this valid receipt for a human to read;
+        # it is the PREVIOUS run's answer. Waiting for this run's own receipt is
+        # non-terminal and counts no bad receipt, so the task stays eligible.
+        return (None, "waiting for this run's receipt (previous run's kept "
+                      "receipt is not re-scanned)", "")
     kind, status, reason, text = parse(raw)
     if kind == "reject":
         return reject(reason)
@@ -1724,7 +1929,39 @@ def cmd_tick(args, root):
     rc = 0
     if not args.no_send:
         rc = run_send(root, args.url, args.secret_file, now, verbose=args.verbose_send)
-    return rc
+    drain = cmd_verify_drain(argparse.Namespace(), root)
+    # Verification changes the ledger after delivery. Project that state onto the
+    # board here; a board failure must never change the handoff result.
+    sync_kanban_after_tick(root)
+    return rc or drain
+
+
+def sync_kanban_after_tick(root):
+    """Run the deterministic board projector after tick verification.
+
+    The script path comes only from AGENT_HANDOFF_KANBAN_SYNC. No path is guessed,
+    and a missing or failing projector is reported without failing the tick.
+    """
+    script = setting("AGENT_HANDOFF_KANBAN_SYNC")
+    if not script:
+        return 0
+    if not os.path.isfile(script):
+        print(f"kanban sync skipped: missing {script}")
+        return 0
+    python = setting("AGENT_HANDOFF_PYTHON") or sys.executable
+    env = os.environ.copy()
+    env["KANBAN_SYNC_LEDGER"] = root
+    try:
+        result = subprocess.run(
+            [python, script, "--no-stdin"], env=env, timeout=120,
+            capture_output=True, text=True)
+    except Exception as exc:  # noqa: BLE001 - observation must not break handoff
+        print(f"kanban sync skipped: {type(exc).__name__}: {exc}")
+        return 0
+    if result.returncode:
+        detail = (result.stderr or result.stdout or "").strip()
+        print(f"kanban sync failed rc={result.returncode}: {detail[:200]}")
+    return 0
 
 
 def save_registry_locked(root, reg):
@@ -2056,6 +2293,385 @@ def list_verify_queue(root):
     return items
 
 
+def _verify_int_setting(name, fallback):
+    """One integer setting with a hard default (Spec §9): a garbage value must never
+    switch a timeout off, so an unparsable setting falls back instead of raising."""
+    try:
+        return int(setting(name) or fallback)
+    except (TypeError, ValueError):
+        return int(fallback)
+
+
+def _verify_max_attempts(vdoc):
+    try:
+        return int(vdoc.get("max_attempts") or setting("AGENT_HANDOFF_MAX_ATTEMPTS") or 60)
+    except (TypeError, ValueError):
+        return 60
+
+
+def classify_missing(root, event_id):
+    """(result, rc, hint) when no verify queue doc is there (Spec §4).
+
+    rc 4 says the --root argument names a project checkout, not a state root: the
+    caller must fix --root and retry; no command here guesses a root for it (the
+    auto-resolution idea is vetoed, Spec §4.3). rc 3 is "no work for you": already
+    verified, a synthetic drill, or an event the script channel never dispatched.
+    The doc_missing_reopen subdivision proves the script claim is on the ledger, so
+    the doc was lost mid-flight and `verify-open` - not a nack - is the repair.
+    A genuinely unknown event stays rc 1.
+
+    The wrong-root proof demands the data/outbox sibling: a freshly created (empty
+    but legitimate) state root has no outbox yet either, and its unknown events must
+    keep the locked rc-1 answer instead of turning into rc 4.
+    """
+    if not os.path.isdir(os.path.join(root, "outbox")):
+        cand = os.path.join(root, "data")
+        if os.path.isdir(os.path.join(cand, "outbox")):
+            return ("invalid_root", 4,
+                    f"--root {root} is not a state root (no outbox/); did you mean {cand}?")
+    if load_verify_acks(root).get(event_id, {}).get("verdict"):
+        return "already_verified", 3, None
+    ev = load_events(root).get(event_id)
+    if ev is None:
+        return "unknown_event", 1, None
+    if ev.get("synthetic"):
+        return "synthetic_not_queued", 3, None
+    marker = read_json(p_claim(root, event_id), None)
+    holder = marker.get("claimer") if isinstance(marker, dict) else None
+    if holder == SCRIPT_CHANNEL_CLAIMER:
+        return ("doc_missing_reopen", 3,
+                f"script channel claimed this event; run verify-open {event_id}")
+    return "not_queued", 3, None
+
+
+def _verify_claim_live(root, event_id, now):
+    """True while a verifier lease still owns the review (Spec §1.1 steal parity).
+
+    Exactly the test _verify_claim_locked applies to a steal: the lease must have
+    elapsed AND the recorded pid must be verifiably gone. A missing marker is a free
+    doc; an empty/unreadable marker is reclaimable there too, never swept around.
+    """
+    marker = read_json(p_verify_claim(root, event_id), None)
+    if not isinstance(marker, dict) or "claimed_at" not in marker:
+        return False
+    expires = marker.get("lease_expires_at")
+    return not (isinstance(expires, int) and now >= expires
+                and pid_exists(marker.get("claimer_pid")) is False)
+
+
+def _verify_notify_event(root, vdoc, status, reason, final_text, now):
+    """Create the §3.1/§1.3 notification event for one verify doc, idempotently.
+
+    The event_id derives from make_event_id(task_id, status, reason, report_fp = the
+    source event id), so replaying the same stall or blocked verdict returns the
+    existing event instead of duplicating router traffic (Invariant I2). Content
+    comes 100% from local state - the ledger, the doc, the registry.
+    """
+    tid = vdoc.get("task_id") or ""
+    task = load_registry(root)["tasks"].get(tid) or {"task_id": tid}
+    st = load_state(root, tid) if tid else {}
+    ev, created = create_event(root, task, st, status, reason, final_text, now,
+                               report_fp=vdoc["event_id"])
+    append_jsonl(p_journal(root), {"at": now, "event_id": ev["event_id"],
+                                   "action": f"{status}_event",
+                                   "state": ev.get("state"), "status": status,
+                                   "source_event_id": vdoc["event_id"]})
+    return ev, created
+
+
+def sweep_verify_stale(root, now):
+    """Reclaim sent/nacked verify docs nobody owns any more (Spec §1, §6.2).
+
+    Zero-LLM, deterministic, no second supervisor: a `sent` doc whose age passed
+    AGENT_HANDOFF_VERIFY_SENT_TIMEOUT with no verdict (doc or ledger) and no live
+    verifier lease goes back to `queued` - the run_send that mounts this sweep then
+    resends it in the same pass, because the delivery itself is what died. A `nacked`
+    doc waits AGENT_HANDOFF_VERIFY_NACK_TIMEOUT and requeues while its nack budget
+    lasts. Both paths CONSUME the send budget (attempts +1 per reclaim): a doc at its
+    ceiling becomes `failed` plus one verify_stalled event, the terminal state that
+    keeps the stall visible instead of silently re-arming forever. Every mutation
+    happens under file_lock with a read-back, so a verdict or a nack that landed
+    while the lock was away wins (Invariant I1/I3, Spec §7.4).
+    """
+    cap = _verify_int_setting("AGENT_HANDOFF_VERIFY_SWEEP_MAX", 20)
+    sent_timeout = _verify_int_setting("AGENT_HANDOFF_VERIFY_SENT_TIMEOUT", 900)
+    nack_timeout = _verify_int_setting("AGENT_HANDOFF_VERIFY_NACK_TIMEOUT", 300)
+    nack_max = _verify_int_setting("AGENT_HANDOFF_VERIFY_NACK_MAX", 3)
+    acks = load_verify_acks(root)
+    requeued = []
+    for snap in list_verify_queue(root):
+        if len(requeued) >= cap:
+            break
+        eid = snap.get("event_id")
+        if not eid or snap.get("verify_state") not in ("sent", "nacked"):
+            continue
+        if snap.get("verdict") or acks.get(eid, {}).get("verdict"):
+            continue
+        path = p_verify(root, eid)
+        with file_lock(root):
+            cur = read_json(path, None)
+            if not isinstance(cur, dict):
+                continue  # closed under us (ack/clear): nothing to sweep
+            state = cur.get("verify_state")
+            if state not in ("sent", "nacked") or cur.get("verdict") \
+                    or acks.get(eid, {}).get("verdict"):
+                # a verdict landed between snapshot and lock: the review answer wins
+                continue
+            attempts = int(cur.get("attempts") or 0)
+            max_attempts = _verify_max_attempts(cur)
+            if state == "sent":
+                sent_at = int(cur.get("sent_at") or 0)
+                if not sent_at or now - sent_at < sent_timeout:
+                    continue
+                if _verify_claim_live(root, eid, now):
+                    # M-4 / Invariant I2: a live lease is a state, not an event, and this
+                    # sweep runs on every tick. Appending unconditionally made the sweep a
+                    # second writer of a doc it does not own - the history grew and the doc
+                    # bytes changed each tick although nothing happened. Record once per
+                    # review round; the round is identified by the sent_at being aborted.
+                    recorded = any(h.get("action") == "sweep_aborted"
+                                   and h.get("reason") == "claim"
+                                   and int(h.get("review_sent_at") or 0) == sent_at
+                                   for h in cur.get("history", []))
+                    if not recorded:
+                        cur.setdefault("history", []).append(
+                            {"at": now, "action": "sweep_aborted", "reason": "claim",
+                             "review_sent_at": sent_at})
+                        write_json_atomic(path, cur)
+                    continue
+                detail = f"sent timeout after {now - sent_at}s"
+                exhausted = "sent timeout: no claim/verdict within budget"
+            else:
+                nacked_at = int(cur.get("nacked_at") or 0)
+                nack_count = int(cur.get("nack_count") or 0)
+                if not nacked_at or now - nacked_at < nack_timeout:
+                    continue
+                if nack_count >= nack_max:
+                    cur["verify_state"] = "failed"
+                    cur["failed_at"] = now
+                    cur["last_error"] = (
+                        "nack budget exhausted: {} nacks; last: {}".format(
+                            nack_count, (cur.get("nack_reason") or "")[:200]))
+                    cur.setdefault("history", []).append(
+                        {"at": now, "action": "verify_stalled",
+                         "reason": cur["last_error"][:200]})
+                    write_json_atomic(path, cur)
+                    _verify_notify_event(root, cur, "verify_stalled",
+                                         "verify budget exhausted",
+                                         cur["last_error"] + f"\nevent_id: {eid}", now)
+                    continue
+                detail = f"nack window elapsed after {now - nacked_at}s"
+                exhausted = "nack budget exhausted: no acceptance within budget"
+            attempts += 1
+            cur["attempts"] = attempts
+            if attempts >= max_attempts:
+                cur["verify_state"] = "failed"
+                cur["failed_at"] = now
+                cur["last_error"] = exhausted
+                cur.setdefault("history", []).append(
+                    {"at": now, "action": "verify_stalled", "reason": detail})
+                write_json_atomic(path, cur)
+                _verify_notify_event(root, cur, "verify_stalled",
+                                     "verify budget exhausted",
+                                     exhausted + f"\nevent_id: {eid}", now)
+                continue
+            cur["verify_state"] = "queued"
+            cur["sent_at"] = None
+            cur.setdefault("history", []).append(
+                {"at": now,
+                 "action": "verify_stale_requeue" if state == "sent" else "verify_nack_requeue",
+                 "code": None, "detail": detail})
+            write_json_atomic(path, cur)
+            requeued.append(eid)
+    escalated = sweep_needs_input_escalations(root, now, cap)
+    if escalated:
+        print(f"sweep: escalated {len(escalated)} aged needs_input blocked verdict(s)")
+    return requeued
+
+
+def _row_at(row):
+    """Ledger `at` as int; a hand-mangled append-only line reads as un-aged (0)."""
+    try:
+        return int(row.get("at") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _parse_needs_input_note(note):
+    """(marker_seen, gap, options) from a §11.2 structured ack note.
+
+    The note stays free text for every other consumer; the sweep only reads the
+    three short keys and never rewrites the ledger line (read-only, I1/§10).
+    """
+    marker = gap = options = ""
+    for line in (note or "").splitlines():
+        low = line.strip()
+        if low.startswith(NEEDS_INPUT_MARKER):
+            marker = low[len(NEEDS_INPUT_MARKER):].strip()
+        elif low.startswith("gap:"):
+            gap = low[len("gap:"):].strip()
+        elif low.startswith("options:"):
+            options = low[len("options:"):].strip()
+    return (bool(marker), gap, options)
+
+
+def load_verify_escalated(root):
+    """Original event_ids already escalated (the §11.3 dedupe set, append-only)."""
+    done = set()
+    try:
+        with open(p_verify_escalations(root), encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if row.get("event_id"):
+                    done.add(row["event_id"])
+    except FileNotFoundError:
+        pass
+    return done
+
+
+def sweep_needs_input_escalations(root, now, cap=None):
+    """One-shot Router escalation for aged needs_input blocked verdicts (Spec §11).
+
+    A verifier that hits an authorization or decision gap must NOT wait for a human
+    in an unattended session (§11.2): it answers `verify-ack --verdict blocked` with
+    a structured note carrying `needs_input:` and exits. §3 wakes the Router the
+    moment that verdict lands; this branch wakes it again when the gap is still
+    unowned after AGENT_HANDOFF_VERIFY_SENT_TIMEOUT - the same "no live handler for
+    this long" budget as §1, deliberately not a new config key (§11.3).
+
+    One notification event per original event, ever: `verify_blocked` with the fixed
+    reason "needs_input escalation", so its event_id differs from the §3.2 verdict
+    notice (same report_fp, different reason) and both coexist; replays collapse in
+    create_event's existing branch, and the append-only verify-escalations.jsonl
+    dedupes even across receipt/state edits. The sweep is that file's only writer.
+    This is a notice, not a retry: no attempts consumption, no requeue, no second
+    escalation, no failed transition - §7.2 stays exactly as written. What enforces
+    "no waiting for input" upstream is the verifier PROMPT CONTRACT plus this
+    deterministic backstop, not a system-level tool block (§11.4); with no
+    AGENT_HANDOFF_ROUTER_TARGET the event simply rides the origin channel and shows
+    as a red `cmd_status` row, and nothing here raises.
+    """
+    sent_timeout = _verify_int_setting("AGENT_HANDOFF_VERIFY_SENT_TIMEOUT", 900)
+    acks = load_verify_acks(root)
+    if cap is None:
+        cap = _verify_int_setting("AGENT_HANDOFF_VERIFY_SWEEP_MAX", 20)
+    candidates = []
+    for eid, row in acks.items():
+        if row.get("verdict") != "blocked":
+            continue
+        marker, gap, options = _parse_needs_input_note(row.get("note"))
+        if not marker:
+            continue
+        at = _row_at(row)
+        if not at or now - at < sent_timeout:
+            continue
+        candidates.append((eid, row, at))
+    if not candidates:
+        return []
+    escalated = []
+    with file_lock(root):
+        done = load_verify_escalated(root)
+        for eid, row, at in sorted(candidates, key=lambda c: c[0]):
+            if len(escalated) >= cap:
+                break
+            if eid in done:
+                continue  # one-shot, forever: a recorded gap never re-fires
+            tid = row.get("task_id") or ""
+            task = load_registry(root)["tasks"].get(tid) or {}
+            _marker, gap, options = _parse_needs_input_note(row.get("note"))
+            body = (
+                f"task: {tid} goal: {task.get('goal') or '-'} "
+                f"target: {task.get('origin_target') or '-'}\n"
+                f"gap: {gap or '-'}\n"
+                f"options: {options or '-'}\n"
+                f"blocked_at: {at} aged: {now - at}s\n"
+                f"original_event: {eid}")
+            ev, _created = _verify_notify_event(
+                root, {"event_id": eid, "task_id": tid}, "verify_blocked",
+                VERIFY_ESCALATION_REASON, body, now)
+            append_jsonl(p_verify_escalations(root), {"event_id": eid,
+                                                      "escalated_at": now,
+                                                      "notify_event_id": ev["event_id"]})
+            done.add(eid)
+            escalated.append(eid)
+    return escalated
+
+
+def _router_wake(root, ev, now):
+    """§3.4 wake the router's own session once per notification event.
+
+    AGENT_HANDOFF_ROUTER_TARGET names the local session the router owns (shape
+    `local:<session-id>`); unset - or this machine runs no Hermes adapter - the
+    blocked/stalled path degrades to exactly the old behaviour (origin notification
+    plus a red status line) without erroring.
+
+    P4-R1 B-1 changed only the failure half of the marker rule. SUCCESS writes
+    outbox/wakes/<event_id>.json and that is the once-per-event record the spec asks
+    for. A FAILURE used to write the same file, so one refused wake - a restarted
+    gateway, a session that exists a minute later - was permanent and the notice never
+    woke anyone again. A failure now journals to outbox/wakes-attempted/ instead, the
+    next tick retries, and WAKE_MAX_ATTEMPTS caps the retries so a permanently wrong
+    target cannot spawn a subprocess on every tick forever.
+    """
+    target = setting("AGENT_HANDOFF_ROUTER_TARGET")
+    if not target or not ORIGIN_TARGET_RE.fullmatch(target) or not target.startswith("local"):
+        return False
+    marker = os.path.join(p_wakes_dir(root), ev["event_id"] + ".json")
+    if os.path.isfile(marker):
+        return False
+    attempt = read_json(wake_attempt_path(root, ev["event_id"]), None) or {}
+    if int(attempt.get("attempts") or 0) >= WAKE_MAX_ATTEMPTS:
+        return False
+    hermes_python = setting("AGENT_HANDOFF_HERMES_PYTHON")
+    hermes_agent_dir = setting("AGENT_HANDOFF_HERMES_AGENT_DIR")
+    if not hermes_python or not hermes_agent_dir:
+        return False
+    if ":" in target:
+        session_id = target.split(":", 1)[1]
+    else:
+        session_id = ((load_registry(root)["tasks"].get(ev.get("task_id")) or {})
+                      .get("session_id") or setting("AGENT_HANDOFF_LOCAL_SESSION") or "")
+    if not session_id:
+        return False
+    text = notify_wake_text(ev)
+    payload = {"channel": "local", "session_key": session_id,
+               "text": text, "session_id": session_id}
+    ok = False
+    detail = "mirrored"
+    try:
+        res = subprocess.run([hermes_python, "-c", WAKE_SNIPPET, hermes_agent_dir,
+                              json.dumps(payload, ensure_ascii=True)],
+                             capture_output=True, text=True, timeout=MIRROR_TIMEOUT)
+        wake = next((line[len(MIRROR_SENTINEL):] for line in (res.stdout or "").splitlines()
+                     if line.startswith(MIRROR_SENTINEL)), None)
+        ok = wake == "1" and int(getattr(res, "returncode", 1)) == 0
+        if not ok:
+            detail = f"wake marker {wake!r} rc {getattr(res, 'returncode', '?')}"
+    except (OSError, subprocess.TimeoutExpired, ValueError) as e:
+        detail = f"wake could not start: {e}"
+    if ok:
+        _ensure_dir(p_wakes_dir(root))
+        write_json_atomic(marker, {"event_id": ev["event_id"], "at": now, "ok": True,
+                                   "target": target, "detail": detail[:200]})
+    else:
+        # B-1: no permanent marker on failure - the next tick is allowed to retry.
+        _ensure_dir(os.path.dirname(wake_attempt_path(root, ev["event_id"])))
+        write_json_atomic(wake_attempt_path(root, ev["event_id"]),
+                          {"event_id": ev["event_id"], "at": now, "ok": False,
+                           "attempts": int(attempt.get("attempts") or 0) + 1,
+                           "target": target, "detail": detail[:200]})
+    append_jsonl(p_journal(root), {"at": now, "event_id": ev["event_id"],
+                                   "action": "router_wake" if ok else "router_wake_failed",
+                                   "state": None, "status": ev.get("status")})
+    return ok
+
+
 def _verify_queue_open(vdoc):
     """A queue doc needs a verify webhook send only while it is neither delivered nor closed.
 
@@ -2064,9 +2680,11 @@ def _verify_queue_open(vdoc):
     already on the ledger, so re-notifying would only produce duplicate reviews.
     verify_state=failed and an exhausted attempt budget close the doc as well: without
     that the tick would keep POSTing an endpoint that demonstrably never accepts.
+    verify_state=nacked is closed too: the verifier explicitly refused the dispatch,
+    and the §6.2 nack window (owned by the sweep) decides when it may be re-offered.
     """
-    if vdoc.get("verify_state") in ("sent", "acked", "failed") or vdoc.get("sent_at") \
-            or vdoc.get("verdict"):
+    if vdoc.get("verify_state") in ("sent", "nacked", "acked", "failed") \
+            or vdoc.get("sent_at") or vdoc.get("verdict"):
         return False
     try:
         attempts = int(vdoc.get("attempts") or 0)
@@ -2077,15 +2695,19 @@ def _verify_queue_open(vdoc):
     return attempts < max_attempts
 
 
-def verify_delivery_id(event_id, attempts):
-    """Delivery id for attempt N of a verify POST.
+def verify_delivery_id(event_id, attempts, nonce=None):
+    """Delivery id for attempt N of a verify POST (Spec §2.2).
 
-    The first try uses the plain verify-<event_id>; every later try gets a fresh id, so a
-    receiver that de-duplicates on the delivery id cannot silently drop the resend (the
-    same reason send_poke suffixes its pokes).
+    The first try uses the plain verify-<event_id>; every later try gets a fresh id,
+    so a receiver that de-duplicates on the delivery id cannot silently drop the
+    resend (the same reason send_poke suffixes its pokes). The retry id also carries
+    a per-send random nonce: two attempts that legitimately share an attempt number
+    (a crash between persisting the attempt and the POST) can then never collide at
+    the gateway. Callers persist the id with the attempt count before the POST.
     """
-    return ("verify-" + event_id if int(attempts) <= 0
-            else f"verify-{event_id}-a{int(attempts)}")
+    if int(attempts) <= 0:
+        return "verify-" + event_id
+    return f"verify-{event_id}-a{int(attempts)}" + (f"-{nonce}" if nonce else "")
 
 
 def send_verify_one(root, vdoc, url, secret, now, timeout=5.0):
@@ -2099,11 +2721,23 @@ def send_verify_one(root, vdoc, url, secret, now, timeout=5.0):
     """
     eid = vdoc["event_id"]
     path = p_verify(root, eid)
+    stalled_doc = None
     with file_lock(root):
         cur = read_json(path, None)
     attempts = int(cur.get("attempts") or 0) if isinstance(cur, dict) \
         else int(vdoc.get("attempts") or 0)
-    did = verify_delivery_id(eid, attempts)
+    # Spec §2.2: every resend carries a fresh random nonce next to the attempt number,
+    # and both delivery-id fields are persisted BEFORE the POST - a crash mid-flight
+    # then leaves pending_delivery_id as the audit trail instead of a lost send.
+    nonce = secrets.token_hex(4) if attempts >= 1 else None
+    did = verify_delivery_id(eid, attempts, nonce)
+    if isinstance(cur, dict):
+        with file_lock(root):
+            chk = read_json(path, None)
+            if isinstance(chk, dict):
+                chk["last_delivery_id"] = did
+                chk["pending_delivery_id"] = did
+                write_json_atomic(path, chk)
     payload = {"schema_version": SCHEMA_VERSION, "task_id": vdoc["task_id"],
                "event_id": eid, "status": vdoc.get("status", "")}
     body = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
@@ -2136,17 +2770,27 @@ def send_verify_one(root, vdoc, url, secret, now, timeout=5.0):
     kind, reject_detail = classify_response(obj, raw, did)
     two_xx = code is not None and 200 <= code < 300
     accepted = two_xx and kind == "accepted"
-    if two_xx and not accepted:
+    duplicate = bool(accepted and isinstance(obj, dict) and _is_duplicate_marker(obj))
+    if duplicate:
+        # Spec §2.3 (verify channel only): "we already hold this delivery" means the
+        # gateway ABSORBED the notification, not that the verifier was woken. The
+        # origin channel keeps duplicate=terminal (§10 untouched); here the doc must
+        # stay un-sent so the next attempt - with a fresh nonce - actually re-fires.
+        accepted = False
+        detail = "gateway deduped this delivery id; not delivered"
+    elif two_xx and not accepted:
         detail = reject_detail or "verify webhook did not acknowledge this event"
     with file_lock(root):
         cur = read_json(path, None)
         if isinstance(cur, dict):
+            cur.pop("pending_delivery_id", None)
             attempts = int(cur.get("attempts") or 0) + 1
             cur["attempts"] = attempts
-            if accepted:
+            state_now = cur.get("verify_state")
+            if accepted and state_now == "queued":
                 cur["verify_state"] = "sent"
                 cur["sent_at"] = now
-            else:
+            elif not accepted and state_now == "queued":
                 try:
                     max_attempts = int(cur.get("max_attempts")
                                        or setting("AGENT_HANDOFF_MAX_ATTEMPTS") or 60)
@@ -2156,11 +2800,34 @@ def send_verify_one(root, vdoc, url, secret, now, timeout=5.0):
                     cur["verify_state"] = "failed"
                     cur["failed_at"] = now
                     cur["last_error"] = (detail or f"http {code}")[:200]
+                    # M-2: the doc died, but saying so only inside this file left the
+                    # stall unannounced. Flag it and notify after the lock is released.
+                    stalled_doc = dict(cur)
+            # a doc that left `queued` under us (nacked/acked by the other side) is
+            # never re-flipped from here: the newer owner wins (Spec §7.2, I1).
             cur.setdefault("history", []).append(
-                {"at": now, "action": "verify_sent" if accepted else "verify_send_failed",
+                {"at": now,
+                 "action": "verify_sent" if accepted else (
+                     "verify_send_duplicate" if duplicate else "verify_send_failed"),
                  "code": code, "delivery_id": did,
                  "detail": (detail[:200] if detail else "")})
             write_json_atomic(path, cur)
+    if stalled_doc is not None:
+        # §1.3 / M-2: exhausting the HTTP attempts budget is a stall, exactly like the
+        # sweep's sent-timeout and nack-budget paths, so it produces the same idempotent
+        # verify_stalled notice (same reason string, same event_id derivation). Without
+        # it a dead verify webhook left a failed doc plus a last_error nobody reads and no
+        # origin notification - the budget ran out in silence. Outside the file_lock above,
+        # because create_event takes that same non-reentrant lock.
+        _verify_notify_event(root, stalled_doc, "verify_stalled",
+                             "verify budget exhausted",
+                             stalled_doc["last_error"] + f"\nevent_id: {eid}", now)
+    if detail:
+        # Spec §3.5: close the human-reading loop. Whatever the receiver answered
+        # now has a durable trail, not just a console line the cron log eats.
+        append_jsonl(p_journal(root), {"at": now, "event_id": eid,
+                                       "action": "verify_response_detail",
+                                       "code": code, "detail": detail[:500]})
     return accepted, detail
 
 
@@ -2169,7 +2836,25 @@ def run_send(root, url, secret_file, now, verbose=False, event_id=None, verify_u
     url = url or setting("AGENT_HANDOFF_URL")
     verify_url = verify_url if verify_url is not None else setting("AGENT_HANDOFF_VERIFY_URL")
     secret_file = secret_file or setting("AGENT_HANDOFF_SECRET_FILE")
+    # Spec §1.4: reclaim stale sent/nacked verify docs inside every send path (tick
+    # included) - the one place all of them meet. Requeued docs are still queue-open
+    # below, so they resend within this same pass; no second supervisor exists.
+    requeued = sweep_verify_stale(root, now)
+    if requeued:
+        print(f"sweep: requeued {len(requeued)} stale verify doc(s)")
     events = load_events(root)
+
+    def wake_notices():
+        """Spec §3.4 / M-3: waking the router's own session is not a delivery step, so it
+        runs on every exit path of a send pass - including a channel that was dropped for
+        a bad URL and a tick that has nothing to send (that is exactly when a wake that
+        failed last tick has to be retried). M-2: it reads the ledger fresh instead of the
+        snapshot above, so a notice created by this very pass is woken in the same tick.
+        _router_wake stays once-per-event and attempt-capped, so re-reading cannot fan out."""
+        for ev in sorted(load_events(root).values(), key=lambda e: e["event_id"]):
+            if ev.get("status") in VERIFY_NOTIFY_STATUSES \
+                    and (event_id is None or ev["event_id"] == event_id):
+                _router_wake(root, ev, now)
     if event_id is not None and event_id not in events:
         print(f"ERROR: unknown event_id {event_id!r}; no events sent")
         return 1
@@ -2194,22 +2879,45 @@ def run_send(root, url, secret_file, now, verbose=False, event_id=None, verify_u
     if not pending and not retries and not verify_items:
         if verbose:
             print("send: nothing pending")
+        wake_notices()
         return 0
     if pending and not url:
         print("send skipped: no receiver configured ($AGENT_HANDOFF_URL or --url); "
               f"{len(pending)} event(s) stay pending")
         pending = []
+    # M-3: a channel's URL is that channel's problem. Validating both (plus the shared
+    # secret) in one try and returning 2 meant an illegal verify URL also swallowed the
+    # report_ready delivery and every notice wake of this tick. Validate per channel and
+    # drop only what cannot be sent; the secret stays a global stop because both
+    # channels sign with it. `dropped` remembers WHY nothing is left: an illegal URL is a
+    # configuration fault (rc 2), a receiver that was simply never configured is the
+    # documented degrade the tick relies on (rc 0, events stay pending).
     secret = None
-    if (pending or retries or verify_items):
+    dropped = False
+    if pending or retries:
         try:
-            if pending or retries:
-                validate_loopback_url(url)
-            if verify_items:
-                validate_loopback_url(verify_url)
+            validate_loopback_url(url)
+        except ValueError as e:
+            print(f"send skipped: origin channel {e} (events stay persisted)")
+            pending, retries = [], []
+            dropped = True
+    if verify_items:
+        try:
+            validate_loopback_url(verify_url)
+        except ValueError as e:
+            print(f"send skipped: verify channel {e} (queue docs stay queued)")
+            verify_items = []
+            dropped = True
+    if pending or retries or verify_items:
+        try:
             secret = load_secret(secret_file)
         except ValueError as e:
             print(f"send skipped: {e} (events stay persisted)")
+            wake_notices()
             return 2
+    if not (pending or retries or verify_items):
+        wake_notices()
+        return 2 if dropped else 0
     for ev in sorted(pending, key=lambda e: e["event_id"]):
         state, detail = send_one(root, ev, url, secret, now)
         # a receiver that answered without accepting (ignored/filtered/anomalous body)
@@ -2226,6 +2934,10 @@ def run_send(root, url, secret_file, now, verbose=False, event_id=None, verify_u
         if verbose or not accepted or detail:
             print("verify-send {} -> {}{}".format(vdoc["event_id"], "sent" if accepted else "pending",
                                                    (f" [{detail}]") if detail else ""))
+    # Spec §3.4: a verify_blocked/verify_stalled notice also wakes the router's own
+    # session (once per event, marker-deduped). No ROUTER_TARGET, or a machine with
+    # no Hermes adapter: degrade silently to origin notification + red status line.
+    wake_notices()
     return 0
 
 
@@ -2240,8 +2952,10 @@ def cmd_send(args, root):
         try:
             validate_loopback_url(args.verify_url)
         except ValueError as e:
-            print(f"ERROR: {e}")
-            return 2
+            # M-3: this used to be a hard `return 2`, so one malformed verify URL vetoed
+            # the whole tick - the report_ready delivery and the notice wake died with it.
+            # Warn; run_send drops only the verify channel.
+            print(f"WARNING: --verify-url {e}; verify channel skipped this pass")
     return run_send(root, args.url, args.secret_file, int(time.time()), verbose=True,
                     event_id=args.event_id, verify_url=getattr(args, "verify_url", None))
 
@@ -2533,6 +3247,8 @@ def cmd_register(args, root):
     receipt_mode = report_path = exit_code_path = None
     rs_dir = None
     stale = []
+    kept = []
+    kept_mtimes = []
     marker_name = getattr(args, "marker_name", None) or DEFAULT_MARKER_NAME
     if not MARKER_NAME_RE.match(marker_name):
         print(f"ERROR: --marker-name must match {MARKER_NAME_RE.pattern}")
@@ -2706,6 +3422,14 @@ def cmd_register(args, root):
                 for path in dict.fromkeys(victims):
                     if not os.path.isfile(path):
                         continue
+                    if _receipt_is_valid(root, prev_entry, path):
+                        # Spec §5.2: --force re-arms the watcher, it does not
+                        # re-roll the run's answer - a valid unconsumed receipt is
+                        # kept on disk and reported, never quietly deleted.
+                        kept.append(path)
+                        with contextlib.suppress(OSError):
+                            kept_mtimes.append(os.path.getmtime(path))
+                        continue
                     try:
                         os.remove(path)
                     except OSError as e:
@@ -2725,10 +3449,24 @@ def cmd_register(args, root):
                      ("exit_code_path", exit_code_path)) + tuple(receipt_cfg or ()):
         if val is not None:
             echo[key] = val
+        if re_register and kept:
+            # Spec §5.2 line 162: the keep path must NOT be re-scanned - consuming
+            # the previous run's receipt as this run's answer is the same pollution
+            # in reverse. Record a watermark: scan_task_receipt treats a receipt no
+            # newer than the freshest kept file as the previous run's, until this
+            # run writes its own.
+            entry["kept_receipt_mtime"] = max(kept_mtimes)
+            write_json_atomic(p_registry(root), reg)
+    if re_register and (stale or kept):
+        echo["stale_cleared"] = len(stale)
+        echo["kept"] = len(kept)
     print(f"registered {json.dumps(echo, ensure_ascii=True)}")
     if re_register and stale:
         print(f"register --force: cleared stale receipt file(s): "
               f"{', '.join(os.path.basename(p) for p in stale)}")
+    for path in kept:
+        print(f"KEEP: {os.path.basename(path)} (valid receipt not yet consumed; "
+              f"--force will not delete it)")
     if origin_target is None and not args.synthetic:
         print("WARN: routing blocked: missing origin_target; no fallback destination")
     return 0
@@ -2745,6 +3483,46 @@ def cmd_unregister(args, root):
         write_json_atomic(p_registry(root), reg)
     print(f"unregistered {tid} (events/receipts kept for audit)")
     return 0
+
+
+def _verify_status_rows(root, tid):
+    """Red-flag view of the verify docs still filed under one task (Spec §1.3).
+
+    `failed` speaks for itself; a `sent` doc past its send timeout with no verdict
+    is a stall in progress - the sweep should have reclaimed it, and if it is still
+    here it must at least be visible, never another silent pending row.
+    """
+    sent_timeout = _verify_int_setting("AGENT_HANDOFF_VERIFY_SENT_TIMEOUT", 900)
+    now = int(time.time())
+    rows = []
+    for v in list_verify_queue(root):
+        if v.get("task_id") != tid:
+            continue
+        stale_sent = bool(v.get("verify_state") == "sent" and v.get("sent_at")
+                          and now - int(v["sent_at"]) >= sent_timeout
+                          and not v.get("verdict"))
+        rows.append({"event_id": v["event_id"],
+                     "verify_state": v.get("verify_state"),
+                     "attempts": int(v.get("attempts") or 0),
+                     "max_attempts": _verify_max_attempts(v),
+                     "nack_count": int(v.get("nack_count") or 0),
+                     "red": v.get("verify_state") == "failed" or stale_sent,
+                     "stale_sent": stale_sent,
+                     "last_error": v.get("last_error")})
+    # §11.3/§11.5: an aged needs_input blocked verdict stays RED even after its
+    # one-shot escalation fired - the gap is human-owned until someone closes it.
+    for eid, row in sorted(load_verify_acks(root).items()):
+        if row.get("verdict") != "blocked" or row.get("task_id") != tid:
+            continue
+        marker, gap, _options = _parse_needs_input_note(row.get("note"))
+        at = _row_at(row)
+        if not marker or not at or now - at < sent_timeout:
+            continue
+        rows.append({"event_id": eid, "verify_state": "needs_input_blocked",
+                     "attempts": 0, "max_attempts": 0, "nack_count": 0,
+                     "red": True, "stale_sent": False,
+                     "last_error": (gap or "needs_input gap awaiting a decision")[:200]})
+    return rows
 
 
 def cmd_status(args, root):
@@ -2768,7 +3546,8 @@ def cmd_status(args, root):
                                                          "retry_state", "next_action_at") if k in e},
                                     "retry_count": int(e.get("retry_count", 0)),
                                     "verdict": acks.get(e["event_id"], {}).get("verdict", "-")}
-                                   for e in sorted(t_evs, key=lambda x: x["created_at"])]}
+                                   for e in sorted(t_evs, key=lambda x: x["created_at"])],
+                        "verify": _verify_status_rows(root, tid)}
         print(json.dumps(out, ensure_ascii=True, indent=1, sort_keys=True))
         return 0
     if not reg["tasks"]:
@@ -2790,6 +3569,10 @@ def cmd_status(args, root):
             blocked = (" blocked:{}".format(e.get("reason_blocked"))) if e.get("state") == "blocked" else ""
             lines.append("  event {} status={} state={} attempts={} verdict={}{}".format(e["event_id"], e["status"], e["state"], e.get("attempts", 0),
                             verdict, blocked))
+        for r in _verify_status_rows(root, tid):
+            lines.append("  verify {} state={} attempts={}/{} nack_count={}{}".format(
+                r["event_id"], r["verify_state"], r["attempts"], r["max_attempts"],
+                r["nack_count"], " RED" if r["red"] else ""))
     print("\n".join(lines))
     return 0
 
@@ -2877,7 +3660,7 @@ def load_verify_doc(root, event_id):
     return None
 
 
-def open_verify_doc(root, event_id, now=None):
+def open_verify_doc(root, event_id, now=None, reset_max=None):
     """(response, rc) for opening or refreshing one verify queue doc.
 
     The handoff exists only for a non-synthetic `report_ready` event whose route is ready,
@@ -2893,8 +3676,13 @@ def open_verify_doc(root, event_id, now=None):
     if ev is None:
         return {"ok": False, "result": "unknown_event", "event_id": event_id}, 1
     if ev.get("synthetic"):
-        # Spec §4.5: a synthetic drill notifies nobody and reviews nothing
-        return {"ok": False, "result": "synthetic_not_queued", "event_id": event_id}, 2
+        # Spec §4.5: a synthetic drill notifies nobody and reviews nothing.
+        # M-5 / Spec §4.1 rc table (docs/spec/verify-lifecycle-sweep-20261119.md:127,
+        # "3=无你的活（已核验/合成/未入队，禁重试成立）", and the same table's
+        # `synthetic_not_queued(3)` branch): rc 2 is a usage error and invites the caller
+        # to fix its arguments and retry, which is wrong for a drill that is by design
+        # unreviewable. classify_missing() already answers 3 for the same condition.
+        return {"ok": False, "result": "synthetic_not_queued", "event_id": event_id}, 3
     if ev.get("status") != "report_ready":
         return {"ok": False, "result": "not_report_ready", "event_id": event_id,
                 "status": ev.get("status")}, 2
@@ -2948,6 +3736,18 @@ def open_verify_doc(root, event_id, now=None):
                     "verdict", "verdict_at", "note", "history"):
             if old.get(key) is not None:
                 doc[key] = old[key]
+        if doc.get("verify_state") == "failed":
+            # Spec §7.1: `failed` is terminal, so re-opening one is a deliberate
+            # budget reset that must name its new ceiling - never an implicit rescue.
+            # The consumed attempts stay on the record; only the ceiling moves.
+            if reset_max is None:
+                return {"ok": False, "result": "failed_doc", "event_id": event_id,
+                        "attempts": int(doc.get("attempts") or 0),
+                        "detail": "verify doc is failed; pass --max-attempts N to "
+                                  "reset the budget explicitly before re-opening"}, 2
+            doc["verify_state"] = "queued"
+            doc["sent_at"] = None
+            doc["max_attempts"] = int(reset_max)
         _ensure_dir(p_verify_dir(root))
         write_json_atomic(path, doc)
     return {"ok": True, "result": "already_opened" if old else "opened",
@@ -2956,26 +3756,10 @@ def open_verify_doc(root, event_id, now=None):
 
 
 def cmd_verify_open(args, root):
-    resp, rc = open_verify_doc(root, args.event_id)
+    resp, rc = open_verify_doc(root, args.event_id,
+                               reset_max=getattr(args, "max_attempts", None))
     print(json.dumps(resp, ensure_ascii=True))
     return rc
-
-
-def _verify_queue_refusal(root, event_id):
-    """(result, rc) when no queue doc is there.
-
-    rc 3 is "no work for you" and covers a review that already closed (verify ledger
-    verdict), a synthetic drill, and a real event the script channel never dispatched; an
-    event this state root has never seen at all is rc 1.
-    """
-    if load_verify_acks(root).get(event_id, {}).get("verdict"):
-        return "already_verified", 3
-    ev = load_events(root).get(event_id)
-    if ev is None:
-        return "unknown_event", 1
-    if ev.get("synthetic"):
-        return "synthetic_not_queued", 3
-    return "not_queued", 3
 
 
 def cmd_verify_show(args, root):
@@ -2983,13 +3767,16 @@ def cmd_verify_show(args, root):
 
     This is the step the verifier Agent runs first: the doc exists only because the
     script channel opened it after a granted dispatch, so its absence is the answer
-    (rc 3 "no work" / rc 1 unknown event) and must never be papered over here.
+    (rc 3 "no work" / rc 1 unknown event / rc 4 wrong --root) and must never be
+    papered over here.
     """
     doc = load_verify_doc(root, args.event_id)
     if doc is None:
-        result, rc = _verify_queue_refusal(root, args.event_id)
-        print(json.dumps({"ok": False, "result": result, "event_id": args.event_id},
-                         ensure_ascii=True))
+        result, rc, hint = classify_missing(root, args.event_id)
+        out = {"ok": False, "result": result, "event_id": args.event_id}
+        if hint:
+            out["hint"] = hint
+        print(json.dumps(out, ensure_ascii=True))
         return rc
     print(json.dumps({"ok": True, "event_id": args.event_id, "verify": doc},
                      ensure_ascii=True))
@@ -3005,9 +3792,12 @@ def cmd_verify_claim(args, root):
     with file_lock(root):
         vdoc = load_verify_doc(root, args.event_id)
         if vdoc is None:
-            result, rc = _verify_queue_refusal(root, args.event_id)
-            print(json.dumps({"ok": False, "result": result, "event_id": args.event_id,
-                              "dispatch": False}, ensure_ascii=True))
+            result, rc, hint = classify_missing(root, args.event_id)
+            out = {"ok": False, "result": result, "event_id": args.event_id,
+                   "dispatch": False}
+            if hint:
+                out["hint"] = hint
+            print(json.dumps(out, ensure_ascii=True))
             return rc
         verdict = vdoc.get("verdict") or load_verify_acks(root).get(args.event_id, {}).get("verdict")
         if verdict:
@@ -3039,21 +3829,43 @@ def cmd_verify_ack(args, root):
             return 2
         vdoc = load_verify_doc(root, args.event_id)
         if vdoc is None:
-            result, rc = _verify_queue_refusal(root, args.event_id)
+            result, rc, hint = classify_missing(root, args.event_id)
             if result == "unknown_event":
                 print("ERROR: unknown event_id")
             else:
-                print(json.dumps({"ok": False, "result": result,
-                                  "event_id": args.event_id}, ensure_ascii=True))
+                out = {"ok": False, "result": result, "event_id": args.event_id}
+                if hint:
+                    out["hint"] = hint
+                print(json.dumps(out, ensure_ascii=True))
             return rc
         if vdoc.get("verdict"):
             print("ERROR: verify verdict already recorded; cannot overwrite")
+            return 2
+        if (vdoc.get("verify_state"), "acked") not in LEGAL_VERIFY_TRANSITIONS:
+            # Spec §7: only an open (queued) or dispatched (sent) doc may be judged;
+            # nacked waits for the sweep, failed waits for an explicit re-open.
+            print(json.dumps({"ok": False, "result": "illegal_transition",
+                              "event_id": args.event_id,
+                              "verify_state": vdoc.get("verify_state"),
+                              "detail": "verify-ack is legal on queued|sent docs only"},
+                             ensure_ascii=True))
             return 2
         note = (args.note or "")[:500]
         append_jsonl(p_verify_acks(root), {"event_id": args.event_id,
                                           "task_id": vdoc.get("task_id"),
                                           "verdict": args.verdict, "note": note,
                                           "claimer": args.claimer or "", "at": now})
+        notify_ev = None
+        notify_created = False
+        if args.verdict == "blocked":
+            # Spec §3.1: a blocked verdict used to live only in a jsonl line nobody
+            # watches; it now also enters the event outbox (idempotent per source
+            # event, §3.3) so origin notification + the §3.4 router wake make the
+            # rework demand actionable instead of silently vanishing (chain ②).
+            notify_ev, notify_created = _verify_notify_event(
+                root, vdoc, "verify_blocked", "verify verdict blocked",
+                f"{note}\nverifier: {args.claimer or ''}\n"
+                f"event_id: {args.event_id}\ntask_id: {vdoc.get('task_id')}", now)
         vdoc["verdict"] = args.verdict
         vdoc["verdict_at"] = now
         vdoc["verify_state"] = "acked"
@@ -3078,8 +3890,77 @@ def cmd_verify_ack(args, root):
             except OSError as e:
                 queue_doc = f"left in place: {e}"
     print(json.dumps({"ok": True, "event_id": args.event_id, "verdict": args.verdict,
-                      "task_id": vdoc.get("task_id"), "queue_doc": queue_doc},
+                      "task_id": vdoc.get("task_id"), "queue_doc": queue_doc,
+                      "notify_event": notify_ev["event_id"] if notify_ev else None,
+                      "notify_event_created": notify_created},
                      ensure_ascii=True))
+    return 0
+
+
+def cmd_verify_nack(args, root):
+    """Verifier: refuse to start a dispatched review, leaving a full trace (Spec §6).
+
+    A nack is an admission failure, never a verdict: it does not touch the verify
+    ledger. Before this command, a verifier that could not begin simply never
+    answered, and the doc stayed `sent` until someone re-opened it by hand - the
+    event vanished without a trace (chain ⑥). `sent` is the only legal source
+    state; the doc stays in the queue and the §1 sweep owns the recovery clock.
+    """
+    reason = (args.reason or "").strip()
+    if not reason:
+        print("ERROR: --reason must be non-empty")
+        return 2
+    eid = args.event_id
+    now = int(time.time())
+    with file_lock(root):
+        if load_verify_acks(root).get(eid, {}).get("verdict"):
+            print("ERROR: verify verdict already recorded; a nack cannot follow a verdict")
+            return 2
+        vdoc = load_verify_doc(root, eid)
+        if vdoc is None:
+            result, rc, hint = classify_missing(root, eid)
+            out = {"ok": False, "result": result, "event_id": eid}
+            if hint:
+                out["hint"] = hint
+            print(json.dumps(out, ensure_ascii=True))
+            return rc
+        if (vdoc.get("verify_state"), "nacked") not in LEGAL_VERIFY_TRANSITIONS:
+            print(json.dumps({"ok": False, "result": "illegal_transition",
+                              "event_id": eid, "verify_state": vdoc.get("verify_state"),
+                              "detail": "a nack is legal only on a dispatched (sent) doc"},
+                             ensure_ascii=True))
+            return 2
+        cur = read_json(p_verify(root, eid), None)  # lock read-back (Invariant I3)
+        if not isinstance(cur, dict) or cur.get("verify_state") != "sent":
+            print(json.dumps({"ok": False, "result": "illegal_transition", "event_id": eid,
+                              "verify_state": (cur or {}).get("verify_state")},
+                             ensure_ascii=True))
+            return 2
+        cur["verify_state"] = "nacked"
+        cur["nacked_at"] = now
+        cur["nack_reason"] = reason[:500]
+        cur["nack_count"] = int(cur.get("nack_count") or 0) + 1
+        cur["sent_at"] = None
+        cur.setdefault("history", []).append({"at": now, "action": "verify_nacked",
+                                              "reason": reason[:200]})
+        write_json_atomic(p_verify(root, eid), cur)
+        append_jsonl(p_journal(root), {"at": now, "event_id": eid,
+                                       "action": "verify_nacked",
+                                       "nack_count": cur["nack_count"], "state": None,
+                                       "status": cur.get("status")})
+        # the verifier gave the review back: its lease marker goes with the nack, or
+        # the §1 sweep would treat the abandoned lease as a live review forever. A
+        # marker this command could not clear is reported, never hidden (the nack
+        # itself already persisted, same honesty rule as verify-ack's queue_doc).
+        claim_marker = "released"
+        if os.path.exists(p_verify_claim(root, eid)):
+            try:
+                os.remove(p_verify_claim(root, eid))
+            except OSError as e:
+                claim_marker = f"left in place: {e}"
+        print(json.dumps({"ok": True, "result": "nacked", "event_id": eid,
+                          "nack_count": cur["nack_count"],
+                          "claim_marker": claim_marker}, ensure_ascii=True))
     return 0
 
 
@@ -3126,6 +4007,89 @@ def cmd_verify_clear(args, root):
     print(json.dumps({"ok": True, "cleared": len(cleared), "event_ids": cleared,
                       "skipped_verdicted": kept, "absent": absent,
                       "reason": reason[:500]}, ensure_ascii=True))
+    return 0
+
+
+def _verify_local_decision(root, doc):
+    """Decide one queued verification from local evidence. Delivery is not acceptance."""
+    event_id = doc.get("event_id") or ""
+    task_id = doc.get("task_id") or ""
+    task = (load_registry(root).get("tasks") or {}).get(task_id) or {}
+    if not task:
+        return "blocked", "task missing from registry"
+    event = load_events(root).get(event_id) or {}
+    if event.get("status") != "report_ready":
+        return "blocked", f"event status={event.get('status') or 'missing'}"
+    source_path = str(task.get("session_path") or "")
+    if not source_path or not os.path.isfile(source_path):
+        return "blocked", "source receipt missing"
+    try:
+        with open(source_path, "r", encoding="utf-8") as handle:
+            source = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        return "blocked", f"source receipt unreadable: {exc}"
+    if not isinstance(source, dict):
+        return "blocked", "source receipt is not an object"
+    if source.get("schema_version") != 1 or source.get("status") != "report_ready":
+        return "blocked", "source receipt status is not report_ready"
+    report_fp = str(source.get("report_fp") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", report_fp):
+        return "blocked", "source report fingerprint missing"
+    report_text = str(source.get("report_text") or "")
+    minimum = int(task.get("min_report_chars") or DEFAULT_MIN_REPORT_CHARS)
+    minimum = max(MIN_MIN_REPORT_CHARS, min(minimum, MAX_MIN_REPORT_CHARS))
+    if len(report_text.strip()) < minimum:
+        return "blocked", "source report is below the minimum length"
+    if hashlib.sha256(report_text.encode("utf-8")).hexdigest() != report_fp:
+        return "blocked", "source report fingerprint mismatch"
+    receipt_path = str(event.get("receipt_path") or "")
+    if not receipt_path or not os.path.isfile(receipt_path):
+        return "blocked", "event receipt missing"
+    try:
+        with open(receipt_path, "r", encoding="utf-8") as handle:
+            receipt = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        return "blocked", f"event receipt unreadable: {exc}"
+    if not isinstance(receipt, dict) or receipt.get("event_id") != event_id:
+        return "blocked", "event receipt identity mismatch"
+    if receipt.get("status") != "report_ready":
+        return "blocked", "event receipt status is not report_ready"
+    return "accepted", "source receipt and event receipt match report_ready"
+
+
+def _capture_command(func, args, root):
+    """Run a JSON command while keeping its own printout out of a batch result."""
+    with contextlib.redirect_stdout(io.StringIO()):
+        return func(args, root)
+
+
+def cmd_verify_drain(args, root):
+    """Accept or block open local verify docs without calling a webhook."""
+    processed, accepted, blocked, skipped = [], [], [], []
+    for doc in list_verify_queue(root):
+        event_id = str(doc.get("event_id") or "")
+        if not event_id or not _verify_queue_open(doc):
+            if event_id:
+                skipped.append(event_id)
+            continue
+        verdict, note = _verify_local_decision(root, doc)
+        claim_args = argparse.Namespace(
+            event_id=event_id, claimer=SCRIPT_CHANNEL_CLAIMER,
+            lease_seconds=int(getattr(args, "lease_seconds", None) or 300), json=True)
+        if _capture_command(cmd_verify_claim, claim_args, root) != 0:
+            skipped.append(event_id)
+            continue
+        ack_args = argparse.Namespace(
+            event_id=event_id, verdict=verdict, note=note,
+            claimer=SCRIPT_CHANNEL_CLAIMER, json=True)
+        if _capture_command(cmd_verify_ack, ack_args, root) != 0:
+            skipped.append(event_id)
+            continue
+        processed.append(event_id)
+        (accepted if verdict == "accepted" else blocked).append(event_id)
+    print(json.dumps({"ok": True, "processed": len(processed), "event_ids": processed,
+                      "accepted": accepted, "blocked": blocked, "skipped": skipped},
+                     ensure_ascii=True))
     return 0
 
 
@@ -3437,6 +4401,14 @@ def build_parser():
     va.add_argument("--note", default="")
     va.add_argument("--claimer", default="")
 
+    vn = sub.add_parser("verify-nack", help="verifier: refuse to START a dispatched review "
+                                            "(admission failure; leaves a trace, the sweep "
+                                            "owns the recovery clock)")
+    vn.add_argument("event_id")
+    vn.add_argument("--reason", required=True,
+                    help="why the review cannot start (route mismatch, unreadable artifact, ...)")
+    vn.add_argument("--claimer", default="")
+
     vsh = sub.add_parser("verify-show", help="verifier: read a verify queue doc, creating nothing")
     vsh.add_argument("event_id")
 
@@ -3444,10 +4416,14 @@ def build_parser():
                         help="script channel: open the verify handoff doc of a dispatched "
                              "report_ready event (idempotent)")
     vo.add_argument("event_id")
+    vo.add_argument("--max-attempts", type=int, default=None,
+                    help="explicit budget ceiling required to re-open a FAILED doc (Spec §7.1)")
 
     vl = sub.add_parser("verify-clear", help="drop unacked verify queue docs (backlog guard)")
     vl.add_argument("--event-id", default=None, help="clear only this queue entry")
     vl.add_argument("--reason", required=True, help="why the backlog is being cleared")
+    vd = sub.add_parser("verify-drain", help="accept or block open local verify docs")
+    vd.add_argument("--lease-seconds", type=int, default=300)
 
     ar = sub.add_parser("archive", help="move closed, verdicted, quiet tasks out of the live registry")
     ar.add_argument("--older-than-days", type=float, default=14.0,
@@ -3511,8 +4487,10 @@ HANDLERS = {"register": cmd_register, "unregister": cmd_unregister, "tick": cmd_
             "ack-pending": cmd_ack_pending, "clean": cmd_clean,
             "send-verify": cmd_send_verify, "release": cmd_release, "defer": cmd_defer,
             "verify-claim": cmd_verify_claim, "verify-ack": cmd_verify_ack,
+            "verify-nack": cmd_verify_nack,
             "verify-show": cmd_verify_show, "verify-open": cmd_verify_open,
-            "verify-clear": cmd_verify_clear, "archive": cmd_archive,
+            "verify-clear": cmd_verify_clear, "verify-drain": cmd_verify_drain,
+            "archive": cmd_archive,
             "prune-claims": cmd_prune_claims}
 
 
