@@ -27,6 +27,30 @@ session file, and every delivery carries an HMAC signature with a receipt to rec
 
 ## 架构 Architecture
 
+AgentWebhook 是 Hermes 多 Agent 接力架构中的事件运输层。完整运行链路是：
+
+```text
+register -> tick/judge -> signed event -> router -> origin session
+                                                     |
+                                                     v
+                                              verify-drain
+                                                     |
+                                                     v
+                                           kanban projection
+                                                     |
+                                                     v
+                                      archive tombstone + watchdog
+```
+
+1. `register` 记录任务、执行 Agent、工作目录和需要被唤醒的原会话。
+2. `tick` 从会话、退出码和活动证据判定 running、完成、失败或卡住，并先把事件落盘。
+3. `router` 校验签名后，把结果送回唯一原会话；无法唯一识别时拒绝投递，不新开会话。
+4. `verify-drain` 在投递后独立验收。投递成功只代表消息送达，不代表任务被接受。
+5. 看板同步在验收之后运行。它只读 handoff 台账，按幂等键投影卡片；失败不影响 handoff 结果。
+6. `archived` 是人工接管后的墓碑，后续同步不再重建、转列、刷新或评论。watchdog 忽略 `handoff-tracker` 镜像卡，避免把投影卡当成真实派工。
+
+同一条主线可以在原会话中迭代。规划、开发、测试、审阅分别登记阶段；一个阶段验收后唤醒原会话，由原会话决定下一阶段，而不是由 webhook 或看板调度。
+
 ```text
 register  ->  tick  ->  signed send  ->  webhook  ->  router  ->  verify
 (登记任务)   (读会话、   (HMAC 签名       (接收端      (按注册表    (二次校验、
