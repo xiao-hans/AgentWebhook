@@ -27,7 +27,7 @@ session file, and every delivery carries an HMAC signature with a receipt to rec
 
 ## 架构 Architecture
 
-AgentWebhook 是 Hermes 多 Agent 接力架构中的事件运输层。完整运行链路是：
+handoff-verdict 是 Hermes 多 Agent 接力架构中的事件运输层。完整运行链路是：
 
 ```text
 register -> tick/judge -> signed event -> router -> origin session
