@@ -1,4 +1,4 @@
-# AgentWebhook
+# handoff-verdict
 
 **给编码 Agent 用的带签名回调（signed webhook）交付层**：注册一个正在跑的任务，
 读取它的会话文件，判断它是完成了、失败了还是卡住了，然后把这件事作为一条事件（event）
